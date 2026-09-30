@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>旅图 · TravelAgent — 智能旅行规划</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@500;700;900&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ═══════════ 导航 ═══════════ -->
+<nav class="nav">
+  <div class="nav-inner">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" class="brand-mark" fill="none" stroke="currentColor" stroke-width="1.8">
+        <path d="M12 21s-7-5.6-7-11a7 7 0 0 1 14 0c0 5.4-7 11-7 11z"/><circle cx="12" cy="10" r="2.6"/>
+      </svg>
+      <span class="brand-name">旅图</span><span class="brand-sub">TravelAgent</span>
+    </div>
+    <div class="nav-status" id="navStatus">
+      <span class="dot" id="dotAmap"></span><span id="lblAmap">高德</span>
+      <span class="dot ok" id="dotRail"></span><span>12306</span>
+      <span class="dot ok"></span><span>本地知识库</span>
+    </div>
+  </div>
+</nav>
+
+<!-- ═══════════ Hero + 规划表单 ═══════════ -->
+<header class="hero">
+  <div class="aurora a1"></div><div class="aurora a2"></div><div class="aurora a3"></div>
+  <div class="hero-inner">
+    <p class="hero-eyebrow">AGENT-POWERED TRAVEL PLANNER</p>
+    <h1 class="hero-title">下一个目的地<br><em>交给旅图去想</em></h1>
+    <p class="hero-sub">定位 · 预算 · 天数 · 出行方式 —— Agent 搜索、判断、编排，给你 3-5 套完整出游方案</p>
+
+    <section class="panel form-panel" id="formPanel">
+      <div class="frow">
+        <div class="fgroup grow">
+          <label>出发位置</label>
+          <div class="loc-line">
+            <button class="btn ghost" id="btnGeo" type="button">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="8"/></svg>
+              定位
+            </button>
+            <select id="selCity"></select>
+            <span class="loc-note" id="locNote"></span>
+          </div>
+        </div>
+      </div>
+      <div class="frow">
+        <div class="fgroup">
+          <label>预算 <output id="budgetOut">¥3000</output></label>
+          <input type="range" id="budget" min="500" max="20000" step="100" value="3000">
+          <div class="range-scale"><span>¥500</span><span>¥20000</span></div>
+        </div>
+        <div class="fgroup">
+          <label>游玩天数</label>
+          <div class="stepper">
+            <button type="button" id="dayMinus">−</button>
+            <span id="daysVal">3</span>
+            <button type="button" id="dayPlus">+</button>
+            <span class="unit">天</span>
+          </div>
+        </div>
+        <div class="fgroup grow">
+          <label>出行方式</label>
+          <div class="chips" id="chipsTransport">
+            <button class="chip on" data-v="auto">不限 · 智能推荐</button>
+            <button class="chip" data-v="train">高铁/火车</button>
+            <button class="chip" data-v="flight">飞机</button>
+            <button class="chip" data-v="drive">自驾</button>
+          </div>
+        </div>
+      </div>
+      <div class="frow">
+        <div class="fgroup grow">
+          <label>旅行偏好 <small>（可多选）</small></label>
+          <div class="chips" id="chipsPrefs">
+            <button class="chip" data-v="自然">自然山水</button>
+            <button class="chip" data-v="人文">人文历史</button>
+            <button class="chip" data-v="美食">美食</button>
+            <button class="chip" data-v="海滨">海滨</button>
+            <button class="chip" data-v="古镇">古镇</button>
+            <button class="chip" data-v="文艺">文艺街区</button>
+            <button class="chip" data-v="亲子">亲子</button>
+            <button class="chip" data-v="摄影">摄影</button>
+          </div>
+        </div>
+        <button class="btn primary" id="btnGo">开始规划
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </button>
+      </div>
+    </section>
+  </div>
+</header>
+
+<!-- ═══════════ Agent 思考时间线 ═══════════ -->
+<section class="stage hidden" id="stageTrace">
+  <div class="wrap">
+    <div class="trace-head">
+      <div class="spinner" id="traceSpinner"></div>
+      <h2 id="traceTitle">Agent 正在思考</h2>
+    </div>
+    <ol class="trace" id="traceList"></ol>
+  </div>
+</section>
+
+<!-- ═══════════ 目的地推荐 ═══════════ -->
+<section class="stage hidden" id="stageDest">
+  <div class="wrap">
+    <h2 class="sec-title">为你挑了这些地方<small id="destMeta"></small></h2>
+    <div id="mapBox" class="map-box"></div>
+    <div class="dest-grid" id="destGrid"></div>
+  </div>
+</section>
+
+<!-- ═══════════ 出游方案 ═══════════ -->
+<section class="stage hidden" id="stagePlans">
+  <div class="wrap">
+    <h2 class="sec-title" id="plansTitle">出游方案</h2>
+    <div class="intel-bar" id="intelBar"></div>
+    <div class="plan-list" id="planList"></div>
+  </div>
+</section>
+
+<!-- ═══════════ 方案详情抽屉 ═══════════ -->
+<div class="drawer-mask hidden" id="drawerMask"></div>
+<aside class="drawer" id="drawer">
+  <button class="drawer-close" id="drawerClose">✕</button>
+  <div id="drawerBody"></div>
+</aside>
+
+<footer class="footer">
+  <div class="wrap">旅图 TravelAgent · Agent 架构演示 — 高德API / 12306 / 本地知识库 多源融合</div>
+</footer>
+
+<div class="toast" id="toast"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

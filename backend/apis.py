@@ -307,21 +307,42 @@ def _dur_hours(s: str):
 
 # ------------------------------------------------------------- web 搜索 ----
 
+def _clean_html(s):
+    import html as _html
+    return _html.unescape(re.sub(r"<[^>]+>", "", s or "")).strip()
+
+
 def web_search_snippets(query: str, count: int = 3):
-    """轻量网页搜索（DuckDuckGo HTML），返回 [{title, snippet, url}]，失败返回 None。"""
+    """轻量网页搜索：Bing 主源，DuckDuckGo 兜底。返回 [{title,snippet,url}] 或 None。"""
+    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        r = requests.get("https://cn.bing.com/search", params={"q": query},
+                         headers=ua, timeout=6)
+        r.raise_for_status()
+        out = []
+        for b in re.findall(r'<li class="b_algo".*?</li>', r.text, re.S):
+            m = re.search(r'<h2[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', b, re.S)
+            if not m:
+                continue
+            p = (re.search(r'<p[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>(.*?)</p>', b, re.S)
+                 or re.search(r'<p[^>]*>(.*?)</p>', b, re.S))
+            out.append({"title": _clean_html(m.group(2)), "url": m.group(1),
+                        "snippet": _clean_html(p.group(1)) if p else ""})
+            if len(out) >= count:
+                break
+        if out:
+            return out
+    except Exception:
+        pass
     try:
         r = requests.get("https://html.duckduckgo.com/html/",
-                         params={"q": query}, headers=_UA, timeout=5)
-        r.raise_for_status()
+                         params={"q": query}, headers=ua, timeout=5)
         titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', r.text)
         snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', r.text)
         urls = re.findall(r'class="result__a"[^>]*href="([^"]+)"', r.text)
-        out = []
-        for i, t in enumerate(titles[:count]):
-            clean = lambda s: re.sub(r"<[^>]+>", "", s).strip()
-            out.append({"title": clean(t),
-                        "snippet": clean(snippets[i]) if i < len(snippets) else "",
-                        "url": urls[i] if i < len(urls) else ""})
-        return out or None
+        return [{"title": _clean_html(t),
+                 "snippet": _clean_html(snippets[i]) if i < len(snippets) else "",
+                 "url": urls[i] if i < len(urls) else ""}
+                for i, t in enumerate(titles[:count])] or None
     except Exception:
         return None

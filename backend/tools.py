@@ -196,11 +196,9 @@ def compose_plans(ctx, origin, dest_name, budget, days, transport, prefs, judged
     c = next(x for x in load_cities() if x["name"] == dest_name)
     km = geo.haversine_km(origin["lat"], origin["lng"], c["lat"], c["lng"])
 
-    rail = None
-    if transport in ("auto", "train"):
-        rail = _real_rail(origin["name"], c["name"])
     trans = geo.estimate_transport(km, transport, c)
     resolved_mode = trans["mode"]
+    rail = _real_rail(origin["name"], c["name"]) if resolved_mode == "train" else None
 
     if rail and resolved_mode == "train":
         one_way = rail["price_2nd"] or trans["cost"]

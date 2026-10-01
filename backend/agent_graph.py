@@ -230,27 +230,42 @@ def _run_react(agent, user_msg):
 
 def _extract_structured(msgs, cls):
     """从消息流提取 submit_result 工具调用的 payload，校验为 pydantic 模型；
-    模型没调用时兜底解析最后一条 AI 文本中的 JSON。"""
+    模型没调用时兜底解析最后一条 AI 文本中的 JSON。
+    返回 (model, err) —— err=None 为成功，否则是失败原因（供 trace 展示）。"""
     for m in reversed(msgs):
         if getattr(m, "type", "") != "ai":
             continue
         for tc in getattr(m, "tool_calls", None) or []:
-            if tc.get("name") == "submit_result" and isinstance(
-                    tc.get("args"), dict):
+            if tc.get("name") != "submit_result":
+                continue
+            args = tc.get("args")
+            if isinstance(args, str):                    # 部分厂商给字符串
                 try:
-                    return cls(**tc["args"].get("payload", tc["args"]))
+                    args = json.loads(args)
                 except Exception:
-                    return None
+                    return None, "submit_result参数非JSON"
+            if not isinstance(args, dict):
+                return None, "submit_result参数异常"
+            payload = args.get("payload", args)
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    return None, "payload非JSON"
+            try:
+                return cls(**payload), None
+            except Exception as e:
+                return None, f"schema校验失败：{str(e)[:90]}"
     for m in reversed(msgs):                        # 兜底：最后一条AI文本里的JSON
         if getattr(m, "type", "") == "ai" and getattr(m, "content", None):
             txt = m.content if isinstance(m.content, str) else ""
             i, j = txt.find("{"), txt.rfind("}")
             if i >= 0 and j > i:
                 try:
-                    return cls(**json.loads(txt[i:j + 1]))
-                except Exception:
-                    return None
-    return None
+                    return cls(**json.loads(txt[i:j + 1])), None
+                except Exception as e:
+                    return None, f"文本JSON校验失败：{str(e)[:90]}"
+    return None, "模型未调用submit_result"
 
 
 # --------------------------------------------- 推荐图：LLM 自主决策 --------
@@ -266,14 +281,15 @@ def n_agent_rank(s: S):
     }, ensure_ascii=False)
 
     msgs, err, steps = _run_react(_rec_agent(), user_msg)
-    out = _extract_structured(msgs, schemas.RecOut)
+    out, ext_err = _extract_structured(msgs, schemas.RecOut)
     if err:
         steps.append(_t("brain", "LLM 调研", f"调用失败：{str(err)[:60]}，转规则引擎"))
         return _rule_rank_pipeline(s, steps)
 
     ranking = getattr(out, "ranking", None) if out else None
     if not ranking:
-        steps.append(_t("brain", "LLM 调研", "输出不合法，转规则引擎"))
+        steps.append(_t("brain", "LLM 调研",
+                        f"输出不合法（{ext_err}），转规则引擎"))
         return _rule_rank_pipeline(s, steps)
 
     # 合并：模型给排序/分数/点评/首推，代码回填真实距离/费用/交通
@@ -430,9 +446,10 @@ def n_agent_plan(s: S):
 
     msgs, err, steps = _run_react(_plan_agent(), user_msg)
     tool_data = _collect_tool_data(msgs)
-    out = _extract_structured(msgs, schemas.PlansOut)
+    out, ext_err = _extract_structured(msgs, schemas.PlansOut)
     if err or not out or not getattr(out, "plans", None):
-        why = f"调用失败：{str(err)[:60]}" if err else "输出不合法"
+        why = (f"调用失败：{str(err)[:60]}" if err
+               else f"输出不合法（{ext_err}）")
         steps.append(_t("judge", "LLM 编排", f"{why}，转规则引擎"))
         # 原地降级到规则流水线（仅知识库城市有兜底素材）
         kb = next((x for x in tools.load_cities()

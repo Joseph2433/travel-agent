@@ -30,6 +30,7 @@ class RecommendReq(BaseModel):
     days: int = 3
     transport: str = "auto"
     prefs: list[str] = []
+    provinces: list[str] = []          # 用户圈定的出行范围（省份名），空=全部可达
 
 
 class PlanReq(RecommendReq):
@@ -89,6 +90,38 @@ def locate(req: LocateReq, request: Request):
     origin = tools.resolve_origin(agent, lat=req.lat, lng=req.lng,
                                   city=req.city, client_ip=ip)
     return origin
+
+
+@app.post("/api/agent/scope")
+def scope(req: RecommendReq, request: Request):
+    """可达范围预览：按出行方式+天数+预算扫描全国地级市池，
+    返回各省份的可行城市数/最快单程耗时/最低单程价，供前端圈范围。"""
+    ip = request.client.host if request.client else None
+    origin = tools.resolve_origin(None, lat=req.lat, lng=req.lng,
+                                  city=req.city, client_ip=ip)
+    scanned = tools.scan_destinations(None, origin, req.budget, req.days,
+                                      req.transport or "auto",
+                                      req.prefs or [])
+    by_prov = {}
+    for s in scanned:
+        if not s.get("feasible"):
+            continue
+        p = by_prov.setdefault(s["province"],
+                               {"name": s["province"], "n": 0,
+                                "min_hours": 99.0, "min_cost": 99999,
+                                "n_fit": 0, "kb": []})
+        p["n"] += 1
+        h = s["transport_est"].get("hours") or 99.0
+        p["min_hours"] = round(min(p["min_hours"], h), 1)
+        p["min_cost"] = min(p["min_cost"], s["transport_est"]["cost"])
+        if s["fits_budget"]:
+            p["n_fit"] += 1
+        if s.get("in_kb"):
+            p["kb"].append(s["city"])
+    provs = sorted(by_prov.values(), key=lambda x: x["min_hours"])
+    return {"origin": {"name": origin["name"], "lat": origin["lat"],
+                       "lng": origin["lng"]},
+            "total": sum(p["n"] for p in provs), "provinces": provs}
 
 
 @app.post("/api/agent/destinations")

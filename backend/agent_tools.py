@@ -22,10 +22,13 @@ def _city(name):
 
 @tool
 def scan_destinations(origin_city: str, budget: int, days: int,
-                      transport: str = "auto", prefs: list = None):
-    """扫描知识库中全部候选目的地。返回每个城市的：距离km、推荐交通方式、
-    单程耗时h、单程费用、预估总花费、是否在预算内、标签、佳季。
-    transport: auto(智能)|train|flight|drive；prefs: 偏好标签如["美食","人文"]。"""
+                      transport: str = "auto", prefs: list = None,
+                      provinces: list = None):
+    """扫描全国可达目的地候选（地级市池约350城，小众城市也在内）。
+    返回每城：省份/距离km/推荐交通mode/单程耗时h/单程费用cost/预估总花费
+    rough_total/是否预算内fits_budget/是否知识库精选in_kb/标签tags。
+    provinces: 用户圈定的省份范围如["浙江","云南"]，为空则全部可达省份。
+    prefs: 偏好标签如["美食","人文"]。只返回最契合的前50条可行候选。"""
     origin = _city(origin_city)
     if not origin:                                  # 非知识库城市 → 高德地理编码兜底
         g = apis.geocode(origin_city)
@@ -35,14 +38,21 @@ def scan_destinations(origin_city: str, budget: int, days: int,
         else:
             return _j({"error": f"出发城市「{origin_city}」无法定位"})
     out = T.scan_destinations(None, origin, budget, days,
-                              transport or "auto", prefs or [])
+                              transport or "auto", prefs or [],
+                              provinces=provinces)
     cities = {c["name"]: c for c in T.load_cities()}
-    for s in out:
-        if s.get("feasible"):
-            c = cities[s["city"]]
-            s["tags"] = c["tags"]
-            s["bestMonths"] = c["bestMonths"]
-    return _j(out)
+    feas = [s for s in out if s.get("feasible")]
+    feas.sort(key=lambda s: (not s["fits_budget"], s["over_ratio"], s["km"]))
+    rows = [{"city": s["city"], "province": s["province"], "km": round(s["km"]),
+             "mode": s["transport_est"]["mode"],
+             "hours": s["transport_est"].get("hours"),
+             "cost": s["transport_est"]["cost"],
+             "rough_total": s["rough_total"], "fits_budget": s["fits_budget"],
+             "in_kb": s["in_kb"],
+             "tags": (cities.get(s["city"]) or {}).get("tags") or []}
+            for s in feas[:50]]
+    return _j({"total_feasible": len(feas), "returned": len(rows),
+               "candidates": rows})
 
 
 @tool
@@ -189,6 +199,6 @@ def submit_result(payload: dict):
     return "已收到，任务结束"
 
 
-REC_TOOLS = [scan_destinations, get_city_profile, submit_result]
+REC_TOOLS = [scan_destinations, get_city_profile, get_city_intel, submit_result]
 PLAN_TOOLS = [get_city_profile, get_city_intel, search_pois, search_xhs_notes,
               query_trains, estimate_transport, calc_budget, submit_result]

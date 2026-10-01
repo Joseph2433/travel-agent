@@ -101,15 +101,19 @@ def _plan_agent():
 REC_PROMPT = """你是「旅图」旅行规划 Agent 的目的地决策大脑。
 
 工作方式：先用工具拿真实数据，推理决策，最后必须调用 submit_result 提交结论。
-1) 调 scan_destinations 获取全部候选的距离/交通方式/耗时/费用/预算匹配
-2) 对感兴趣的候选调 get_city_profile 看景点量、美食、贴士、佳季
+1) 调 scan_destinations 获取可达候选：若用户消息中"圈定省份"不是"不限"，
+   必须把该列表传给 scan_destinations 的 provinces 参数，且最终只推荐其中的城市。
+   in_kb=true 是知识库精选城市；in_kb=false 是其他城市（包括小众目的地）——
+   两者都可推荐，别只挑热门
+2) 对感兴趣的城市：知识库城调 get_city_profile 看景点/美食/佳季；
+   小众城市可改调 get_city_intel 看它的实时POI密度/天气/攻略热度再判断
 3) 综合维度：预算契合、天数匹配（每天约2-3个景点）、当前月份 vs 佳季、偏好命中、交通效率
 
 最后用 submit_result 提交，payload 结构：
 {"ranking":[{"city":"城市名","score":0-100整数,"comment":"≤25字点评"},...3-6条],
  "pick":"首推城市名(必须在ranking中)","why":"≤40字理由"}
 
-硬约束：只推荐工具返回中 feasible=true 的城市。"""
+硬约束：只推荐工具返回中 fits_budget=true 或略超预算(over_ratio≤1.3)的城市。"""
 
 PLAN_PROMPT = """你是「旅图」旅行规划 Agent 的行程编排大脑。
 
@@ -239,6 +243,7 @@ def n_agent_rank(s: S):
     user_msg = json.dumps({
         "出发地": origin["name"], "预算": req["budget"], "天数": req["days"],
         "出行方式": req.get("transport", "auto"), "偏好": req.get("prefs") or [],
+        "圈定省份": req.get("provinces") or "不限（全国可达范围）",
         "当前月份": datetime.now().month,
     }, ensure_ascii=False)
 
@@ -257,21 +262,30 @@ def n_agent_rank(s: S):
     scanned = {x["city"]: x for x in
                tools.scan_destinations(None, origin, req["budget"], req["days"],
                                        req.get("transport", "auto"),
-                                       req.get("prefs") or []) if x["feasible"]}
+                                       req.get("prefs") or [],
+                                       provinces=req.get("provinces") or None)
+               if x["feasible"]}
     cities = {c["name"]: c for c in tools.load_cities()}
     dests = []
     for item in ranking[:6]:
         name = item.city.rstrip("市")
-        sc, c = scanned.get(name), cities.get(name)
-        if not sc or not c:
+        sc = scanned.get(name)
+        if not sc:
             continue
+        c = cities.get(name) or tools.pool_profile(
+            name, sc.get("province", ""), sc.get("lat"), sc.get("lng"))
+        in_kb = name in cities
+        reasons = _rule_reasons(sc, c, req)
+        if not in_kb:
+            reasons.append("小众目的地 · 行程由实时POI编排")
         dests.append({
-            "city": name, "province": c["province"],
+            "city": name, "province": c["province"] or sc.get("province", ""),
             "score": max(0, min(100, int(item.score))),
             "km": sc["km"], "lat": c["lat"], "lng": c["lng"],
-            "tags": c["tags"], "transport_est": sc["transport_est"],
+            "tags": c["tags"], "in_kb": in_kb,
+            "transport_est": sc["transport_est"],
             "rough_total": sc["rough_total"], "hotelPerNight": c["hotelPerNight"],
-            "reasons": _rule_reasons(sc, c, req),
+            "reasons": reasons,
             "ai_comment": (item.comment or "")[:40],
             "llm_pick": name == (getattr(out, "pick", "") or "").rstrip("市"),
         })
@@ -307,7 +321,8 @@ def _rule_rank_pipeline(s: S, prior_steps):
     req = s["req"]
     scanned = tools.scan_destinations(None, s["origin"], req["budget"], req["days"],
                                       req.get("transport", "auto"),
-                                      req.get("prefs") or [])
+                                      req.get("prefs") or [],
+                                      provinces=req.get("provinces") or None)
     feas = [x for x in scanned if x["feasible"]]
     steps = prior_steps + [
         _t("scan", "扫描候选目的地",
@@ -330,7 +345,8 @@ def n_scan(s: S):
     req = s["req"]
     scanned = tools.scan_destinations(None, s["origin"], req["budget"], req["days"],
                                       req.get("transport", "auto"),
-                                      req.get("prefs") or [])
+                                      req.get("prefs") or [],
+                                      provinces=req.get("provinces") or None)
     feas = [x for x in scanned if x["feasible"]]
     out = {"scanned": scanned,
            "trace": [_t("scan", "扫描候选目的地",

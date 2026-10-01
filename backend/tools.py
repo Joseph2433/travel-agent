@@ -53,21 +53,54 @@ def resolve_origin(ctx, lat=None, lng=None, city=None, client_ip=None):
             "src": "default", "note": "定位不可用，默认以上海为出发地"}
 
 
-def scan_destinations(ctx, origin, budget, days, transport, prefs):
-    """扫描全部候选目的地：距离、交通可行性、粗略预算。"""
-    out = []
-    for c in load_cities():
-        if c["name"] == origin["name"]:
+def pool_profile(name, province="", lat=None, lng=None):
+    """非知识库城市的合成画像：距离/预算估算用中性消费档，
+    景点/美食信息交由实时 POI 工具补齐。"""
+    return {"name": name, "province": province,
+            "lat": lat if lat is not None else 35.0,
+            "lng": lng if lng is not None else 110.0,
+            "hotelPerNight": 280, "foodPerDay": 110, "localPerDay": 40,
+            "attractions": [], "foods": [], "tags": [], "bestMonths": [],
+            "hsRail": True, "airport": True, "tips": []}
+
+
+def scan_destinations(ctx, origin, budget, days, transport, prefs,
+                      provinces=None):
+    """扫描目的地候选。默认池是全国地级市种子（357城）：知识库城市用真实
+    画像估算，其余城市用合成档估算，小众目的地因此也能进入候选。
+    provinces: 省份名列表（如 ["浙江","云南"]），限定推荐范围。"""
+    kb = {c["name"]: c for c in load_cities()}
+    pool = apis.all_prefecture_cities() or [
+        {"name": c["name"], "province": c["province"],
+         "lat": c["lat"], "lng": c["lng"]} for c in load_cities()]
+    provs = {p.rstrip("省") for p in (provinces or [])}
+    out, seen = [], set()
+    for row in pool:
+        name = row["name"]
+        if name in seen or name == origin["name"]:
             continue
+        seen.add(name)
+        if provs and row["province"].rstrip("省") not in provs:
+            continue
+        if row.get("lat") is None or row.get("lng") is None:
+            continue
+        c = kb.get(name) or pool_profile(name, row["province"],
+                                         row["lat"], row["lng"])
         km = geo.haversine_km(origin["lat"], origin["lng"], c["lat"], c["lng"])
+        if km < 30:                                 # 同一都市圈，不算出游
+            continue
         est = geo.estimate_transport(km, transport, c)
         if not est.get("feasible"):
-            out.append({"city": c["name"], "feasible": False, "reason": est.get("reason"), "km": km})
+            out.append({"city": name, "feasible": False,
+                        "reason": est.get("reason"), "km": km})
             continue
         tickets = sum(a["ticket"] for a in c["attractions"] if a["must"] >= 4)
-        rough = geo.trip_budget(c, days, est["cost"], attraction_ticket_sum=tickets * 0.6)
+        rough = geo.trip_budget(c, days, est["cost"],
+                                attraction_ticket_sum=tickets * 0.6)
         out.append({
-            "city": c["name"], "feasible": True, "km": km,
+            "city": name, "province": row["province"],
+            "lat": c["lat"], "lng": c["lng"],
+            "feasible": True, "km": km, "in_kb": name in kb,
             "transport_est": est, "rough_total": rough["total"],
             "fits_budget": rough["total"] <= budget,
             "over_ratio": round(rough["total"] / max(budget, 1), 2),
@@ -83,7 +116,9 @@ def rank_destinations(ctx, scanned, budget, days, prefs):
     for s in scanned:
         if not s["feasible"]:
             continue
-        c = cities[s["city"]]
+        c = cities.get(s["city"]) or pool_profile(
+            s["city"], s.get("province", ""), s.get("lat"), s.get("lng"))
+        in_kb = s["city"] in cities
         score, reasons = 0, []
         # 预算（35）
         if s["fits_budget"]:
@@ -92,8 +127,9 @@ def rank_destinations(ctx, scanned, budget, days, prefs):
             score += 15; reasons.append(f"略超预算（约¥{s['rough_total']}，可降住宿档位）")
         else:
             reasons.append(f"超预算较多（约¥{s['rough_total']}）")
-        # 天数（20）：景点量与天数匹配
-        need = max(2, min(6, round(len(c["attractions"]) / 2)))
+        # 天数（20）：景点量与天数匹配；非知识库城市按中性值3天
+        need = (max(2, min(6, round(len(c["attractions"]) / 2)))
+                if c["attractions"] else 3)
         if days >= need:
             score += 20; reasons.append(f"{days}天玩得从容")
         elif days == need - 1:
@@ -105,17 +141,19 @@ def rank_destinations(ctx, scanned, budget, days, prefs):
             score += 15; reasons.append("正值佳季")
         else:
             score += 5
-        # 偏好（20）
+        # 偏好（20）；非知识库城市无标签，给个"小众"标记分兜底
         hit = set(prefs) & set(c["tags"])
         if hit:
             score += min(20, 8 * len(hit)); reasons.append("契合偏好：" + "、".join(hit))
+        elif not in_kb:
+            score += 6; reasons.append("小众目的地 · 行程由实时POI编排")
         # 距离效率（10）：交通耗时越短越好
         h = s["transport_est"].get("hours", 99)
         score += max(0, 10 - h)
         scored.append({
             "city": c["name"], "province": c["province"], "score": round(score),
             "km": s["km"], "lat": c["lat"], "lng": c["lng"],
-            "tags": c["tags"], "reasons": reasons,
+            "tags": c["tags"], "in_kb": in_kb, "reasons": reasons,
             "transport_est": s["transport_est"], "rough_total": s["rough_total"],
             "hotelPerNight": c["hotelPerNight"],
         })

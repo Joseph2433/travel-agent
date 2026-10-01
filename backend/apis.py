@@ -128,7 +128,10 @@ def district_cities(province: str):
     prov = province.strip().rstrip("省市自治区壮族回族维吾尔") or province.strip()
     try:
         d = _amap_get("/v3/config/district", keywords=prov, subdistrict=1)
-        top = (d.get("districts") or [{}])[0]
+        dists = d.get("districts") or []
+        # 省名可能有同名下级区（如天津河北区劫持"河北"），优先取省级区划
+        top = next((x for x in dists if x.get("level") == "province"),
+                   dists[0] if dists else {})
         subs = top.get("districts") or []
         if prov in _DIRECT or not subs:
             c = (top.get("center") or "").split(",")
@@ -153,6 +156,43 @@ PROVINCES = ["北京", "天津", "河北", "山西", "内蒙古", "辽宁", "吉
              "湖北", "湖南", "广东", "广西", "海南", "重庆", "四川", "贵州",
              "云南", "西藏", "陕西", "甘肃", "青海", "宁夏", "新疆",
              "香港", "澳门", "台湾"]
+
+
+_PREF_FILE = os.path.join(os.path.dirname(__file__), "data",
+                          "prefecture_cities.json")
+_pref_cache = None
+
+
+def all_prefecture_cities():
+    """全国地级市种子 [{name,province,lat,lng(,full)}]，约 357 城。
+    优先读 data/prefecture_cities.json 快照；文件缺失且有 key 时在线拉全量
+    行政区接口并落盘；两者皆不可用返回 None（调用方降级知识库池）。"""
+    global _pref_cache
+    if _pref_cache is not None:
+        return _pref_cache
+    try:
+        with open(_PREF_FILE, encoding="utf-8") as f:
+            _pref_cache = json.load(f)
+        return _pref_cache
+    except Exception:
+        pass
+    if not amap_available():
+        return None
+    rows, seen = [], set()
+    try:
+        for prov in PROVINCES:
+            for r in district_cities(prov) or []:
+                if r["name"] and r["name"] not in seen and r.get("lat") is not None:
+                    seen.add(r["name"])
+                    rows.append({"name": r["name"], "province": prov,
+                                 "lat": r["lat"], "lng": r["lng"]})
+        if rows:
+            with open(_PREF_FILE, "w", encoding="utf-8") as f:
+                json.dump(rows, f, ensure_ascii=False, indent=0)
+    except Exception:
+        return None
+    _pref_cache = rows or None
+    return _pref_cache
 
 
 def poi_search(city: str, keywords: str, poi_type: str = "", count: int = 8):

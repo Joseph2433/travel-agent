@@ -1,7 +1,8 @@
 /* ═══════════ 旅图 TravelAgent 前端逻辑 ═══════════ */
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
-const state = { origin: null, dests: [], plans: [], intel: null, map: null };
+const state = { origin: null, dests: [], plans: [], intel: null, map: null,
+                provinces: [] };
 
 const ICONS = { pin:"◎", scan:"◈", rank:"✦", search:"⌕", judge:"⚖", rail:"⇄", plan:"▤", brain:"❖", pen:"✎", think:"✧", tool:"⚙", observe:"◉" };
 
@@ -44,6 +45,36 @@ async function loadCities(prov){
       `<option value="${c.name}" data-lat="${c.lat ?? ""}" data-lng="${c.lng ?? ""}">${c.name}</option>`
     ).join("") || `<option>${prov}</option>`;
   }catch(e){ sel.innerHTML = `<option>${prov}</option>`; }
+  queueScope();
+}
+
+/* ── 出行范围：按出行方式/天数/预算算出各省份可达城市数，用户可圈选 ── */
+let _scopeTimer = null;
+function queueScope(){
+  clearTimeout(_scopeTimer);
+  _scopeTimer = setTimeout(loadScope, 350);
+}
+async function loadScope(){
+  const opt = $("#selCity").selectedOptions[0];
+  if (!opt || !opt.value) return;
+  const body = collectParams();
+  try{
+    const r = await fetch("/api/agent/scope", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(body)
+    }).then(r => r.json());
+    const box = $("#chipsScope");
+    state.provinces = state.provinces.filter(p =>
+      (r.provinces || []).some(x => x.name === p));
+    box.innerHTML = (r.provinces || []).slice(0, 28).map(p =>
+      `<button type="button" class="chip scope ${state.provinces.includes(p.name) ? "on" : ""}"
+        data-v="${p.name}">${p.name} <i>${p.n}城·最快${p.min_hours}h</i></button>`
+    ).join("");
+    $("#scopeNote").textContent =
+      `共 ${r.total} 城可达` + (state.provinces.length
+        ? ` · 已圈定 ${state.provinces.length} 省` : "（不选 = 全部可达）");
+    $("#scopeRow").style.display = "";
+  }catch(e){ $("#scopeRow").style.display = "none"; }
 }
 
 function locateByGPS(silent){
@@ -69,6 +100,7 @@ function locateByGPS(silent){
       sel.value = r.name;
       state.origin = r;
       note.textContent = `已定位：${r.name}（${r.note||"GPS"}）`;
+      queueScope();
     }catch(e){ note.textContent = "定位失败，请手动选择"; }
   }, () => {
     note.textContent = "定位被拒，请手动选择出发城市";
@@ -85,18 +117,29 @@ function bindForm(){
       ((budget.value - budget.min) / (budget.max - budget.min) * 100) + "%");
   };
   budget.addEventListener("input", sync); sync();
+  budget.addEventListener("change", queueScope);
 
   let days = 3;
   const dv = $("#daysVal");
-  $("#dayMinus").onclick = () => { days = Math.max(1, days - 1); dv.textContent = days; };
-  $("#dayPlus").onclick  = () => { days = Math.min(10, days + 1); dv.textContent = days; };
+  $("#dayMinus").onclick = () => { days = Math.max(1, days - 1); dv.textContent = days; queueScope(); };
+  $("#dayPlus").onclick  = () => { days = Math.min(10, days + 1); dv.textContent = days; queueScope(); };
   state.getDays = () => days;
 
   $("#chipsTransport").addEventListener("click", e => {
     const c = e.target.closest(".chip"); if (!c) return;
     $("#chipsTransport").querySelectorAll(".chip").forEach(x => x.classList.remove("on"));
     c.classList.add("on");
+    queueScope();
   });
+  $("#chipsScope").addEventListener("click", e => {
+    const c = e.target.closest(".chip"); if (!c) return;
+    c.classList.toggle("on");
+    state.provinces = $$("#chipsScope .chip.on").map(x => x.dataset.v);
+    $("#scopeNote").textContent = $("#scopeNote").textContent.replace(
+      /（.*）| · 已圈定 .*省/, "") +
+      (state.provinces.length ? ` · 已圈定 ${state.provinces.length} 省` : "（不选 = 全部可达）");
+  });
+  $("#selCity").addEventListener("change", queueScope);
   $("#chipsPrefs").addEventListener("click", e => {
     const c = e.target.closest(".chip"); if (c) c.classList.toggle("on");
   });
@@ -116,6 +159,7 @@ function collectParams(){
     days: state.getDays(),
     transport: $("#chipsTransport .chip.on").dataset.v,
     prefs: $$("#chipsPrefs .chip.on").map(c => c.dataset.v),
+    provinces: state.provinces,
   };
 }
 
@@ -200,6 +244,7 @@ function renderDestinations(r){
   const sec = $("#stageDest"), grid = $("#destGrid");
   $("#destMeta").textContent =
     `从 ${r.origin.name} 出发 · ${state.dests.length} 个候选 · 按综合得分排序`
+    + (state.provinces.length ? ` ｜ 范围：${state.provinces.join("、")}` : "")
     + (r.verdict && r.verdict.why ? ` ｜ AI复核：${r.verdict.why}` : "");
   grid.innerHTML = "";
   state.dests.forEach((d, i) => {
@@ -210,7 +255,7 @@ function renderDestinations(r){
       <div class="dest-rank">${MEDALS[i]}</div>
       ${d.llm_pick ? `<div class="dest-pick">❖ AI 首推</div>` : ""}
       <div class="dest-city">${d.city}<i>${d.province} · ${Math.round(d.km)}km</i></div>
-      <div class="dest-tags">${d.tags.map(t => `<span class="tag">${t}</span>`).join("")}</div>
+      <div class="dest-tags">${d.in_kb === false ? `<span class="tag niche">小众</span>` : ""}${d.tags.map(t => `<span class="tag">${t}</span>`).join("")}</div>
       ${d.ai_comment ? `<div class="dest-ai">${d.ai_comment}</div>` : ""}
       <div class="dest-score">
         <div class="ring">${scoreRing(d.score)}<span class="num">${d.score}</span></div>

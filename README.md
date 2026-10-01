@@ -1,6 +1,9 @@
 # 旅图 · TravelAgent
 
-一个 Agent 驱动的智能旅行规划应用：根据**当前定位、预算、出行天数、出行方式**推荐目的地，再由 Agent 搜索目的地情报、判断取舍，最终生成 **3-5 套完整出游方案**（交通往返 + 每日行程 + 吃喝玩乐 + 预算拆解）。
+一个 Agent 驱动的智能旅行规划应用：根据**当前定位、预算、出行天数、出行方式**
+先圈出可达范围（全国 372 个地级市，可再按省份筛选），再由 Agent 推荐目的地、
+搜索当地情报、判断取舍，最终生成 **3-5 套完整出游方案**（交通往返 +
+每日行程 + 吃喝玩乐 + 预算拆解）。小众城市同样可推荐/可规划。
 
 ## 架构
 
@@ -30,12 +33,15 @@ TravelAgent  backend/agent.py        # 门面：一次请求 = 一次 LangGraph 
    │                  ── Bing/DuckDuckGo  攻略网页摘要（含 site:xiaohongshu.com 定向）
    │                  ── 小红书笔记搜索  需本地 xiaohongshu-mcp（可选，XHS_API_BASE）
    ├─► geo.py         ── 距离/交通/预算估算模型（无网兜底）
-   └─► data/cities.json             # 25 城种子知识库：画像/消费档兜底，
-                                     # 景点美食可由高德POI实时数据取代
+   ├─► data/cities.json             # 25 城种子知识库：画像/消费档兜底，
+   │                                # 景点美食可由高德POI实时数据取代
+   └─► data/prefecture_cities.json  # 全国 372 地级市坐标种子（高德行政区生成，
+                                     # 推荐候选池；文件缺失且有key时自动重建）
 ```
 
 **真 Agent 模式**（配 `LLM_API_KEY` 后）：模型自主决定调哪些工具、调几次——
-目的地推荐时它自己扫描候选、挑感兴趣的城市深入看画像、打分排序并给首推；
+目的地推荐时它在**全国 372 城候选池**（可按用户圈定省份过滤）里扫描，
+对感兴趣的小众城市还能调 `get_city_intel` 查实况再推荐；
 行程规划时它自己查攻略摘要/天气/POI/12306往返车次，还能用 `search_pois`
 实时搜任意类别的景点/美食（带评分/参考价/地址），编排 3-5 套差异化方案
 （每天槽位、餐厅景点、档位系数都由它决定），推理与工具调用全程进 trace 回放。
@@ -85,7 +91,8 @@ release 二进制 → 跑 `xiaohongshu-login` 扫码登录自己的小红书账�
 | GET | /api/geo/provinces | 34 省级列表（出发地第一级） |
 | GET | /api/geo/cities?province=xx | 该省地级市（高德行政区接口） |
 | POST | /api/locate | GPS 坐标 → 最近出发城市 |
-| POST | /api/agent/destinations | 阶段一：推荐目的地（含 trace + AI复核） |
+| POST | /api/agent/scope | 可达范围预览：各省份可行城市数/最快耗时 |
+| POST | /api/agent/destinations | 阶段一：推荐目的地（含 trace + AI复核，可圈省份） |
 | POST | /api/agent/plans | 阶段二：搜索+判断+生成 3-5 套方案（可指定任意目的地） |
 | POST | /api/agent/destinations/stream | 同上，SSE 流式：逐步推 trace 事件 |
 | POST | /api/agent/plans/stream | 同上，SSE 流式 |

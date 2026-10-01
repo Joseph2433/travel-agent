@@ -42,17 +42,21 @@ pip install -r requirements.txt
 python run.py        # → http://127.0.0.1:8000
 ```
 
-可选环境变量（不配也能跑，自动降级）：
+可选配置（不配也能跑，自动降级）。推荐写到 `.env`：
 
 ```bash
-# Windows cmd                     # bash
-set AMAP_KEY=你的高德key            export AMAP_KEY=...
-set LLM_API_KEY=你的模型key         export LLM_API_KEY=...
-set LLM_BASE_URL=https://api.moonshot.cn/v1   # 默认即 Moonshot
-set LLM_MODEL=kimi-k2-0905-preview            # 换 base_url 时记得换模型名
+cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
 ```
 
-注意：key 在**进程启动时**读取，改完环境变量要重启 `run.py`。
+| 变量 | 作用 | 缺省行为 |
+|---|---|---|
+| `AMAP_KEY` | 高德 Web 服务 key（IP定位/POI/天气/驾车） | 估算模型 |
+| `LLM_API_KEY` | 大模型 key（OpenAI 兼容协议） | 规则引擎决策 |
+| `LLM_BASE_URL` | 默认 `https://api.moonshot.cn/v1` | — |
+| `LLM_MODEL` | 默认 `kimi-k2-0905-preview` | — |
+
+也可以直接 export/set 环境变量（优先级高于 .env）。
+注意：配置在**进程启动时**读取，改完要重启 `python run.py`。
 
 ## API
 

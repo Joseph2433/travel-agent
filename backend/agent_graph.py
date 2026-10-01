@@ -811,26 +811,37 @@ def _poi_cost(p, default):
 def _map_item(it, att_map, food_map, poi_map=None, food_pool=None):
     """把模型给的名字映射回真实对象：知识库 → 高德POI → 丢弃/通配。
     支持子串模糊匹配；查无实据的景点一律丢弃（防幻觉）。
-    food_pool 提供后，美食项附不同价位备选 options。"""
+    food_pool 提供后，美食项附不同价位备选 options。
+    开放时间校验：非夜间型景点被排进晚间档 → 降级回下午。"""
     name, typ = (it.name or "").strip(), (it.type or "景点")
     poi_map = poi_map or {}
+    late_slots = ("晚上", "夜宵", "傍晚", "下午茶/夜宵")
     if typ == "景点":
         a = att_map.get(name) or next(
             (v for k, v in att_map.items() if k in name or name in k), None)
+        res, oh = None, ""
         if a:
-            return {"slot": it.slot, "type": "景点", "name": a["n"],
-                    "note": a["desc"], "cost": a["ticket"],
-                    "hours": a["hours"], "_ticket": a["ticket"]}
-        p = poi_map.get(name) or next(
-            (v for k, v in poi_map.items() if k in name or name in k), None)
-        if p:
-            cost = _poi_cost(p, 45)
-            return {"slot": it.slot, "type": "景点", "name": p["name"][:16],
-                    "note": f"{p.get('_src') or '高德POI'} · "
-                            f"评分{p.get('rating') or '—'} · "
-                            f"{(p.get('addr') or '')[:24]}",
-                    "cost": cost, "hours": 3, "_ticket": cost}
-        return None
+            res = {"slot": it.slot, "type": "景点", "name": a["n"],
+                   "note": a["desc"], "cost": a["ticket"],
+                   "hours": a["hours"], "_ticket": a["ticket"]}
+        else:
+            p = poi_map.get(name) or next(
+                (v for k, v in poi_map.items() if k in name or name in k), None)
+            if p:
+                cost = _poi_cost(p, 45)
+                oh = p.get("open_hours") or ""
+                res = {"slot": it.slot, "type": "景点", "name": p["name"][:16],
+                       "note": f"{p.get('_src') or '高德POI'} · "
+                               f"评分{p.get('rating') or '—'}"
+                               + (f" · 开放{oh}" if oh else "")
+                               + f" · {(p.get('addr') or '')[:24]}",
+                       "cost": cost, "hours": 3, "_ticket": cost}
+        if res is None:
+            return None
+        if res["slot"] in late_slots and not tools._night_ok(
+                res["name"] + res["note"], oh):
+            res["slot"] = "下午"
+        return res
     if typ == "美食":
         f = food_map.get(name) or next(
             (v for k, v in food_map.items() if k in name or name in k), None)

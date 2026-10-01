@@ -1,6 +1,7 @@
 """Agent 工具集：定位解析、目的地扫描排序、情报搜索、情报判断、行程编排。"""
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -410,19 +411,48 @@ _STYLE_CFG = {
 }
 _STYLE_DEF = {"start": 9.0, "meal": 1.0, "gap": 0.5, "shift": 0.0, "take": 0}
 
-# slot 标签 → 最早开始时刻（小时），再按风格 shift 微调
-_SLOT_EARLIEST = {"午餐": 11.5, "午后": 13.0, "下午": 13.5,
-                  "下午茶/夜宵": 15.0, "晚餐": 17.5, "晚上": 19.0}
+# slot 标签 → 最早开始时刻（小时），再按风格 shift 微调。
+# 只有餐/夜类槽位有地板；上午/下午类项目连续排，不留死档。
+_SLOT_EARLIEST = {"早餐": 6.5, "中午": 11.5, "午餐": 11.5, "下午茶/夜宵": 15.0,
+                  "下午茶": 15.0, "傍晚": 17.0, "晚餐": 17.5,
+                  "晚上": 19.0, "夜宵": 20.5}
 _DUR_DEF = {"景点": 3.0, "休闲": 1.5, "交通": 2.0}
 # 槽位 → 日内规范顺序（返程交通恒排当天末尾，去程恒排最前）
-_SLOT_ORDER = {"上午": 0, "全天": 0, "午餐": 3, "午后": 4, "下午": 5,
-               "下午茶/夜宵": 6, "晚餐": 7, "晚上": 8}
+_SLOT_ORDER = {"早餐": 0, "上午": 1, "全天": 1, "中午": 2, "午餐": 2,
+               "午后": 3, "下午": 4, "下午茶/夜宵": 5, "下午茶": 5,
+               "傍晚": 6, "晚餐": 6, "晚上": 7, "夜宵": 8}
+
+# 名字/简介含这些词的景点视作夜间可去（开放街区类），其余默认 ~17:45 闭园
+_NIGHT_WORDS = ("街", "巷", "夜", "古镇", "古城", "城墙", "码头",
+                "灯光", "喷泉", "广场", "步行", "河", "桥")
+_SCENIC_CLOSE = 17.75                     # 无开放时间数据时的保守闭园时刻
+
+
+def _night_ok(text, open_hours=None):
+    """景点能否排晚间：名字/简介含开放街区特征，或已知闭园时间 ≥19:30。"""
+    if any(w in (text or "") for w in _NIGHT_WORDS):
+        return True
+    close = _close_hour(open_hours)
+    return close is not None and close >= 19.5
+
+
+def _close_hour(open_hours):
+    """从 \"08:00-17:30\" / \"11:00-14:30 16:30-21:30\" 解析最晚闭园时刻。"""
+    times = re.findall(r"(\d{1,2})[:：]\d{2}", open_hours or "")
+    if not times:
+        return None
+    return float(times[-1])
 
 
 def _item_rank(d, it):
+    """日内排序键：(槽位序, 闭园约束) —— 同槽位内有闭园时间的景点排前面。"""
     if it.get("type") == "交通":
-        return 9 if "返程" in (it.get("name") or "") else -1
-    return _SLOT_ORDER.get(it.get("slot") or "", 5)
+        return (9, 0) if "返程" in (it.get("name") or "") else (-1, 0)
+    rank = _SLOT_ORDER.get(it.get("slot") or "", 4)
+    # 有闭园约束的景点 → 同槽位内排前；夜间可去的项目/其他类型靠后
+    night_ok = it.get("type") != "景点" or _night_ok(
+        (it.get("name") or "") + (it.get("note") or ""))
+    return (rank, 1 if night_ok else 0)
 
 
 def _style_cfg(style):
@@ -460,6 +490,14 @@ def assign_times(days, style="适中"):
                     dur = _DUR_DEF.get(it.get("type"), 1.5)
             it["time"] = (f"{_hm(cur)}–{_hm(cur + dur)}"
                           if cur < 23.9 else "深夜后")
+            # 开放时间校验：非夜间型景点排到 ~17:45 之后 → 标注意见
+            if it.get("type") == "景点" and cur + dur > _SCENIC_CLOSE:
+                m = re.search(r"开放([\d:：\-–—至 ]+)", it.get("note") or "")
+                if not _night_ok((it.get("name") or "")
+                                 + (it.get("note") or ""),
+                                 m.group(1) if m else None):
+                    it["note"] = ((it.get("note") or "")
+                                  + " ⏰此时段或已过闭园时间，建议提前")
             cur += dur + cfg["gap"]
     return days
 
@@ -720,6 +758,13 @@ def _build_plan(theme, city, origin, attractions, foods, days,
     big = [a for a in atts if a["hours"] >= 7]   # 需整天的景点
     normal = [a for a in atts if a["hours"] < 7]
 
+    # 抵达日：交通耗时短 → 早到，第一天可当整天排满
+    try:
+        arr_h = float(transport.get("hours") or 0)
+    except (TypeError, ValueError):
+        arr_h = 0.0
+    full_first = cfg["start"] + arr_h <= 10.5
+
     for d in range(1, days + 1):
         items = []
         if d == 1:
@@ -737,8 +782,9 @@ def _build_plan(theme, city, origin, attractions, foods, days,
         else:
             pool = normal
 
-        # 挑选当日景点；特种兵多加一个、休闲随意减一个
-        take = max(1, (density if 1 < d < days else 1) + cfg["take"])
+        # 挑选当日景点；特种兵多加一个、休闲随意减一个；早到首日按中间日算
+        full_day = 1 < d < days or (d == 1 and full_first)
+        take = max(1, (density if full_day else 1) + cfg["take"])
         picked = []
         # 中间日优先安排"需一整天"的大景点（每个行程最多2个大景点日）
         big_cap = 1 if days <= 3 else 2
@@ -758,9 +804,12 @@ def _build_plan(theme, city, origin, attractions, foods, days,
             pool.remove(a)
 
         slot_order = ["上午", "下午", "晚上"]
-        base = 1 if d == 1 else 0          # 抵达日景点从下午排起
+        base = 0 if (d > 1 or full_first) else 1   # 晚到首日景点从下午排起
         for i, a in enumerate(picked):
             slot = "全天" if a["hours"] >= 7 else slot_order[min(i + base, 2)]
+            # 开放时间校验：夜间不开放的景点不占晚间档
+            if slot == "晚上" and not _night_ok(a["n"] + a.get("desc", "")):
+                slot = "下午"
             real = _qunar_price(a["n"], qunar)
             items.append({"slot": slot, "type": "景点", "name": a["n"],
                           "note": a["desc"],

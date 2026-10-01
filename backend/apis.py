@@ -265,10 +265,13 @@ def poi_search(city: str, keywords: str, poi_type: str = "", count: int = 8):
             biz = p.get("business") or p.get("biz_ext") or {}
             rating = biz.get("rating") if isinstance(biz, dict) else None
             cost = biz.get("cost") if isinstance(biz, dict) else None
+            open_hours = ((biz.get("opentime_today") or biz.get("opentime_week"))
+                          if isinstance(biz, dict) else None)
             pois.append({
                 "name": p.get("name"), "type": p.get("type"),
                 "addr": p.get("address") if isinstance(p.get("address"), str) else "",
                 "rating": rating, "cost": cost,
+                "open_hours": (open_hours or "")[:40] or None,
             })
         return {"pois": pois, "src": "amap"}
     except Exception:

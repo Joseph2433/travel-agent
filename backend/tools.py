@@ -160,6 +160,14 @@ def judge_intel(ctx, intel, days, prefs):
     kept = kept[:cap]
     for a in overflow:
         dropped.append({"name": a["n"], "reason": "天数内排不下，忍痛割爱"})
+    notes += _base_notes(intel)
+    return {"kept": kept, "dropped": dropped, "notes": notes,
+            "foods": c["foods"][:5], "tips": c["tips"]}
+
+
+def _base_notes(intel):
+    """客观提示：天气/POI热度/季节——两种判断引擎共用。"""
+    c, month, notes = intel["city"], datetime.now().month, []
     if intel.get("weather"):
         w = intel["weather"]
         notes.append(f"当前实况：{w['weather']} {w['temp']}°C")
@@ -172,6 +180,41 @@ def judge_intel(ctx, intel, days, prefs):
         notes.append(f"{month}月正值{c['name']}佳季")
     else:
         notes.append(f"{month}月非{c['name']}最佳季节（佳季：{'/'.join(map(str,c['bestMonths']))}月）")
+    return notes
+
+
+def apply_llm_judge(intel, days, prefs, llm_out):
+    """把 LLM 的取舍结论与硬约束合并，产出与 judge_intel 同构的结果。
+
+    LLM 决定优先级与剔除理由；代码负责：名单合法性校验（只允许真实景点名）、
+    天数容量裁剪、客观 notes 补齐。llm_out 不合法时返回 None 交由调用方降级。
+    """
+    if not isinstance(llm_out, dict) or not isinstance(llm_out.get("keep"), list):
+        return None
+    c = intel["city"]
+    names = {a["n"]: a for a in c["attractions"]}
+    keep_seq = [n for n in llm_out["keep"] if n in names]
+    if not keep_seq:
+        return None
+    drop_reasons = {}
+    for x in llm_out.get("drop") or []:
+        if isinstance(x, dict) and x.get("name") in names:
+            drop_reasons[x["name"]] = str(x.get("reason") or "模型建议剔除")[:30]
+
+    cap = max(3, round(days * 2.5))
+    # LLM 点名保留的优先；其未提及也未剔除的按推荐度补位至容量满
+    ordered = keep_seq + [a["n"] for a in
+                          sorted(c["attractions"], key=lambda a: -a["must"])
+                          if a["n"] not in keep_seq and a["n"] not in drop_reasons]
+    kept_names = ordered[:cap]
+    kept = sorted((names[n] for n in kept_names), key=lambda a: -a["must"])
+    dropped = ([{"name": n, "reason": drop_reasons[n]}
+                for n in drop_reasons if n not in kept_names]
+               + [{"name": n, "reason": "天数内排不下，忍痛割爱"}
+                  for n in ordered[cap:] if n not in drop_reasons])
+    notes = [str(x).strip()[:60] for x in (llm_out.get("notes") or [])
+             if isinstance(x, str) and x.strip()][:4]
+    notes += _base_notes(intel)
     return {"kept": kept, "dropped": dropped, "notes": notes,
             "foods": c["foods"][:5], "tips": c["tips"]}
 

@@ -158,6 +158,10 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
   font-size:13px;font-weight:600;transition:.2s}
 .pick-btn:hover{background:var(--teal-d)}
 .budget-bad{font-size:10px;color:var(--coral);display:block;margin-top:2px}
+.dest-pick{position:absolute;top:0;left:0;background:linear-gradient(135deg,var(--teal),var(--teal-d));
+  color:#fff;font-size:11px;font-weight:600;padding:5px 12px;border-radius:0 0 12px 0;letter-spacing:1px}
+.dest-ai{font-size:12px;color:var(--teal-d);background:rgba(15,163,168,.07);
+  border-left:3px solid var(--teal);border-radius:0 8px 8px 0;padding:7px 10px;margin:-4px 0 6px}
 
 /* ── 方案卡片 ── */
 .intel-bar{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 24px;font-size:12px;color:var(--ink2)}
@@ -181,6 +185,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 .pace{font-size:10px;padding:3px 9px;border-radius:6px;background:rgba(15,163,168,.1);
   color:var(--teal-d);font-family:var(--sans);font-weight:500;letter-spacing:1px}
 .plan-desc{font-size:13px;color:var(--ink3);margin-top:6px}
+.ai-note{font-size:12.5px;color:var(--teal-d);margin-top:6px;font-style:italic}
 .plan-days{font-size:12px;color:var(--ink2);margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}
 .mini-day{background:var(--paper);border-radius:6px;padding:3px 9px;font-size:11px;color:var(--ink2)}
 .plan-right{text-align:right;flex-shrink:0}

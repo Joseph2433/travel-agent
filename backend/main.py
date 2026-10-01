@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from agent import TravelAgent
 import apis
+import llm
 import tools
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +38,8 @@ class PlanReq(RecommendReq):
 def status():
     return {
         "amap": apis.amap_available(),
+        "llm": llm.llm_available(),
+        "llm_model": llm.model_name() if llm.llm_available() else None,
         "cities": len(tools.load_cities()),
         "modes": list(__import__("geo").TRANSPORT_MODES.items()),
     }

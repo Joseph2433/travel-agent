@@ -2,7 +2,7 @@
 const $ = s => document.querySelector(s);
 const state = { origin: null, dests: [], plans: [], intel: null, map: null };
 
-const ICONS = { pin:"◎", scan:"◈", rank:"✦", search:"⌕", judge:"⚖", rail:"⇄", plan:"▤" };
+const ICONS = { pin:"◎", scan:"◈", rank:"✦", search:"⌕", judge:"⚖", rail:"⇄", plan:"▤", brain:"❖", pen:"✎" };
 
 function toast(msg, ms = 2600){
   const t = $("#toast"); t.textContent = msg; t.classList.add("show");
@@ -17,6 +17,9 @@ async function init(){
     const dot = $("#dotAmap"), lbl = $("#lblAmap");
     if (st.amap){ dot.classList.add("ok"); lbl.textContent = "高德API"; }
     else { dot.classList.add("warn"); lbl.textContent = "高德(未配Key)"; }
+    const ld = $("#dotLlm"), ll = $("#lblLlm");
+    if (st.llm){ ld.classList.add("ok"); ll.textContent = "AI决策 · " + (st.llm_model || ""); }
+    else { ld.classList.add("warn"); ll.textContent = "规则模式"; }
   }catch(e){}
   try{
     const cities = await fetch("/api/cities").then(r => r.json());
@@ -139,7 +142,8 @@ const MEDALS = ["NO.1","NO.2","NO.3","NO.4","NO.5","NO.6"];
 function renderDestinations(r){
   const sec = $("#stageDest"), grid = $("#destGrid");
   $("#destMeta").textContent =
-    `从 ${r.origin.name} 出发 · ${state.dests.length} 个候选 · 按综合得分排序`;
+    `从 ${r.origin.name} 出发 · ${state.dests.length} 个候选 · 按综合得分排序`
+    + (r.verdict && r.verdict.why ? ` ｜ AI复核：${r.verdict.why}` : "");
   grid.innerHTML = "";
   state.dests.forEach((d, i) => {
     const card = document.createElement("div");
@@ -147,8 +151,10 @@ function renderDestinations(r){
     const tr = d.transport_est;
     card.innerHTML = `
       <div class="dest-rank">${MEDALS[i]}</div>
+      ${d.llm_pick ? `<div class="dest-pick">❖ AI 首推</div>` : ""}
       <div class="dest-city">${d.city}<i>${d.province} · ${Math.round(d.km)}km</i></div>
       <div class="dest-tags">${d.tags.map(t => `<span class="tag">${t}</span>`).join("")}</div>
+      ${d.ai_comment ? `<div class="dest-ai">${d.ai_comment}</div>` : ""}
       <div class="dest-score">
         <div class="ring">${scoreRing(d.score)}<span class="num">${d.score}</span></div>
         <ul class="dest-reasons">${d.reasons.slice(0,3).map(x => `<li>${x}</li>`).join("")}</ul>
@@ -223,6 +229,8 @@ function renderPlans(r){
   const ib = $("#intelBar");
   const srcBadge = r.intel.sources.map(s => `<span class="intel-pill">数据源 · ${s}</span>`).join("");
   ib.innerHTML = srcBadge +
+    `<span class="intel-pill ${r.judge_engine && r.judge_engine.startsWith("llm") ? "" : "warn"}">取舍引擎 · ${
+      {llm:"LLM 决策", rule:"规则引擎", "rule-fallback":"规则兜底"}[r.judge_engine] || "规则引擎"}</span>` +
     (r.intel.weather ? `<span class="intel-pill">当地天气 · ${r.intel.weather.weather} ${r.intel.weather.temp}°C</span>` : "") +
     r.intel.notes.slice(0,3).map(n => `<span class="intel-pill">${n}</span>`).join("") +
     (r.intel.dropped.length ? `<span class="intel-pill warn">已剔除 ${r.intel.dropped.length} 项不合时令/排不下的项目</span>` : "");
@@ -238,6 +246,7 @@ function renderPlans(r){
       <div class="plan-mid">
         <div class="plan-name">${p.name}<span class="pace">${p.pace}</span></div>
         <div class="plan-desc">${p.desc}</div>
+        ${p.ai_note ? `<div class="ai-note">❖ ${p.ai_note}</div>` : ""}
         <div class="plan-days">${p.days.map(d => `<span class="mini-day">D${d.day} ${d.title}</span>`).join("")}</div>
       </div>
       <div class="plan-right">

@@ -15,6 +15,7 @@ def _shape_recommend(s):
            "destinations": s.get("ranked", []),
            "more": s.get("more") or [],
            "total_feasible": s.get("total_feasible"),
+           "date": s["req"].get("date"),
            "verdict": s.get("verdict")}
     if s.get("message"):
         out["message"] = s["message"]
@@ -25,6 +26,7 @@ def _shape_plan(s, req):
     r, intel, judged = s["result"], s["intel"], s["judged"]
     return {
         "trace": s.get("trace", []), "origin": s["origin"], "dest": req["dest"],
+        "date": req.get("date"),
         "km": r["km"], "resolved_mode": r["resolved_mode"],
         "judge_engine": s.get("judge_engine", "rule"),
         "intel": {

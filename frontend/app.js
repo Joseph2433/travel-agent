@@ -273,6 +273,11 @@ function bindForm(){
   $("#dayPlus").onclick  = () => { days = Math.min(10, days + 1); dv.textContent = days; queueScope(); };
   state.getDays = () => days;
 
+  /* 出发日期：可选；min=今天；选中即提示星期/周末/假期/预售期 */
+  const inp = $("#inpDate"), t0 = new Date();
+  inp.min = `${t0.getFullYear()}-${String(t0.getMonth() + 1).padStart(2, "0")}-${String(t0.getDate()).padStart(2, "0")}`;
+  inp.addEventListener("change", () => { dateHint(); queueScope(); });
+
   $("#chipsTransport").addEventListener("click", e => {
     const c = e.target.closest(".chip"); if (!c) return;
     $("#chipsTransport").querySelectorAll(".chip").forEach(x => x.classList.remove("on"));
@@ -302,6 +307,23 @@ function bindForm(){
   document.addEventListener("keydown", e => { if (e.key === "Escape") history.back(); });
 }
 
+/* 出发日期即时提示：星期/周末/固定假期/12306预售期（权威判定在后端 notes） */
+function dateHint(){
+  const v = $("#inpDate").value, el = $("#dateNote");
+  if (!v){ el.textContent = "留空则按临近日期规划"; return; }
+  const d = new Date(v + "T00:00:00");
+  if (isNaN(d)) { el.textContent = ""; return; }
+  const away = Math.round((d - new Date().setHours(0,0,0,0)) / 864e5);
+  const md = v.slice(5);
+  let t = `周${"日一二三四五六"[d.getDay()]}出发`;
+  if (d.getDay() === 0 || d.getDay() === 6) t += " · 周末档";
+  if ((md >= "10-01" && md <= "10-07")) t += " · 国庆高峰";
+  else if (md >= "05-01" && md <= "05-05") t += " · 五一高峰";
+  else if (md === "01-01") t += " · 元旦";
+  if (away > 13) t += " · 超12306预售期·车票为估算";
+  el.textContent = t;
+}
+
 function collectParams(){
   const opt = $("#selCity").selectedOptions[0];
   return {
@@ -310,6 +332,7 @@ function collectParams(){
     lng: opt && opt.dataset.lng ? +opt.dataset.lng : null,
     budget: +$("#budget").value,
     days: state.getDays(),
+    date: $("#inpDate").value || null,
     transport: $("#chipsTransport .chip.on").dataset.v,
     prefs: $$("#chipsPrefs .chip.on").map(c => c.dataset.v),
     provinces: state.provinces,
@@ -395,6 +418,7 @@ function renderDestinations(r){
   const sec = $("#stageDest"), grid = $("#destGrid");
   $("#destMeta").textContent =
     `从 ${r.origin.name} 出发 · 精选 ${state.dests.length} 个`
+    + (r.date ? ` · ${r.date.slice(5).replace("-", "/")}出发` : "")
     + (r.total_feasible ? ` · 共 ${r.total_feasible} 个可达` : "")
     + ` · 按综合得分排序`
     + (state.provinces.length ? ` ｜ 范围：${state.provinces.join("、")}` : "")
@@ -517,7 +541,9 @@ async function runPlans(dest){
 function renderPlans(r){
   const sec = $("#stagePlans"), list = $("#planList");
   $("#plansTitle").innerHTML = `${r.dest} 出游方案
-    <small>${r.origin.name} 出发 · ${Math.round(r.km)}km · ${r.plans.length} 套可选</small>`;
+    <small>${r.origin.name} 出发 · ${Math.round(r.km)}km`
+    + `${r.date ? " · " + r.date.slice(5).replace("-", "/") + "出发" : ""}`
+    + ` · ${r.plans.length} 套可选</small>`;
 
   const ib = $("#intelBar");
   const srcBadge = r.intel.sources.map(s => `<span class="intel-pill">数据源 · ${s}</span>`).join("");
@@ -634,7 +660,7 @@ function renderPlanDetail(p, r){
 
   $("#detailBody").innerHTML = `
     <div class="d-title">${r.dest} · ${p.name}</div>
-    <div class="d-sub">${p.desc} · ${p.pace}节奏 · ${r.origin.name}出发往返</div>
+    <div class="d-sub">${p.desc} · ${p.pace}节奏 · ${r.origin.name}出发往返${r.date ? " · " + r.date.slice(5).replace("-", "/") + "出发" : ""}</div>
 
     <div class="train-box">
       <h4>往返交通

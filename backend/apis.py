@@ -120,6 +120,24 @@ def weather_live(city_name: str):
         return None
 
 
+def weather_forecast(city_name: str):
+    """高德逐日天气预报（extensions=all，今天起共4天）。
+    返回 [{date,week,day,night,hi,lo,wind}] 或 None。"""
+    if not amap_available():
+        return None
+    try:
+        d = _amap_get("/v3/weather/weatherInfo", city=city_name,
+                      extensions="all")
+        casts = ((d.get("forecasts") or [{}])[0]).get("casts") or []
+        out = [{"date": c.get("date"), "week": c.get("week"),
+                "day": c.get("dayweather"), "night": c.get("nightweather"),
+                "hi": c.get("daytemp"), "lo": c.get("nighttemp"),
+                "wind": c.get("daywind")} for c in casts]
+        return out or None
+    except Exception:
+        return None
+
+
 def district_cities(province: str):
     """高德行政区域查询：某省下辖城市列表 [{name, lat, lng}]。
     直辖市/特区返回自身；无 key 或失败返回 None 由调用方降级。"""

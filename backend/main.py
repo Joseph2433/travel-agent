@@ -135,6 +135,7 @@ class RecommendReq(BaseModel):
     city: str | None = None
     budget: int = 3000
     days: int = 3
+    date: str | None = None            # 出发日期 YYYY-MM-DD（可选）
     transport: str = "auto"
     prefs: list[str] = []
     provinces: list[str] = []          # 用户圈定的出行范围（省份名），空=全部可达

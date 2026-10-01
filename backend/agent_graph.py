@@ -112,7 +112,9 @@ REC_PROMPT = """你是「旅图」旅行规划 Agent 的目的地决策大脑。
    小众城市可改调 get_city_intel 看它的实时POI密度/天气/攻略热度再判断；
    还可调 travel_trends 看微博/抖音/小红书热搜，正在热议的目的地/玩法可优先
 3) 综合维度：预算契合、天数匹配（每天约2-3个景点）、当前月份 vs 佳季、偏好命中、
-   交通效率、热榜热度
+   交通效率、热榜热度；用户给了出发日期时还要考虑：节假日/周末高峰 →
+   短途圈更稳（票源好抢、路上不耗时），超12306预售期（约15天）的日期
+   车次只能估算需在理由中说明
 
 最后用 submit_result 提交，payload 结构：
 {"ranking":[{"city":"城市名","score":0-100整数,"comment":"≤25字点评"},...3-6条],
@@ -130,11 +132,15 @@ submit_result 提交结论。
    店名或避雷细节时加 with_detail=true 拿正文摘录。小红书未配置时跳过，改看
    get_city_intel 的网页攻略摘要。
 2) 骨架验证：get_city_profile 看知识库景点/美食/贴士/消费档；get_city_intel 拿
-   实时天气、高德POI、去哪儿真实票价(scenic_qunar.ticket 是真实挂牌价)。
+   实时天气（weather实况 + forecast近4天逐日预报，行程落在预报窗口内的
+   要在 notes/guide 里写清每日天气）、高德POI、去哪儿真实票价
+   (scenic_qunar.ticket 是真实挂牌价)。
    笔记里出现的店名/景点，先用 search_pois 核实真实存在再编进方案；
    需要特定类别（博物馆/夜市/古镇/亲子等）时用 search_pois 主动补充。
-3) 交通：出行方式为 train/auto 时调 query_trains 拿真实车次票价；
-   其他方式调 estimate_transport。
+3) 交通：出行方式为 train/auto 时调 query_trains 拿真实车次票价——
+   用户给了出发日期时传 dep_date=出发日、ret_date=出发日+天数-1；
+   超出12306预售期(约15天)查不到就调 estimate_transport 并在 notes 说明未开售；
+   其他方式直接调 estimate_transport。
 4) 编排 3-5 套差异化方案（主题如：经典全景/寻味美食/深度慢游/精华快闪/舒适度假，
    可按目的地特点自由命名）：
    - 每套 days 数量 = 用户天数；每天排 景点/美食/休闲 槽位（上午/下午/晚上/全天/午餐/晚餐）
@@ -270,12 +276,29 @@ def _extract_structured(msgs, cls):
 
 # --------------------------------------------- 推荐图：LLM 自主决策 --------
 
+def _date_ctx(req):
+    """出发日期上下文联描：未指定 / 10月3日·周五·国庆假期高峰·超预售期。"""
+    meta = tools.date_meta(req.get("date"), req.get("days") or 1)
+    if not meta:
+        return "未指定（按临近日期规划）"
+    s = meta["label"]
+    if meta["holiday"]:
+        s += f"·{meta['holiday']}假期高峰"
+    elif meta["weekend"]:
+        s += "·周末档"
+    if not meta["rail_sale"]:
+        s += "·超12306预售期(车次按估算)"
+    return s
+
+
 def n_agent_rank(s: S):
     """LLM Agent：自主调工具调研候选，输出排序+点评+首推。"""
     req, origin = s["req"], s["origin"]
+    meta = tools.date_meta(req.get("date"), req["days"])
     user_msg = json.dumps({
         "出发地": origin["name"], "预算": req["budget"], "天数": req["days"],
         "出行方式": req.get("transport", "auto"), "偏好": req.get("prefs") or [],
+        "出发日期": _date_ctx(req),
         "圈定省份": req.get("provinces") or "不限（全国可达范围）",
         "当前月份": datetime.now().month,
     }, ensure_ascii=False)
@@ -333,9 +356,17 @@ def n_agent_rank(s: S):
                     f"调研 {len([m for m in msgs if getattr(m,'type','')=='tool'])} 次工具，"
                     f"首推「{verdict['pick'] or dests[0]['city']}」"))
     picked = {d["city"] for d in dests}
+    if meta and (meta.get("holiday") or meta.get("weekend")):
+        tag = meta.get("holiday") or "周末"          # 给选中目的地也标峰期属性
+        for d in dests:
+            h = d["transport_est"].get("hours", 99)
+            d["reasons"].append(
+                f"{tag}短途圈·票源相对稳" if h <= 4
+                else f"{tag}长线·车票紧俏需早订" if h >= 7
+                else f"{tag}出行档")
     extra = [r for r in tools.rank_destinations(
                  None, list(scanned.values()), req["budget"], req["days"],
-                 req.get("prefs") or [])
+                 req.get("prefs") or [], meta=meta)
              if r["city"] not in picked]
     return {"ranked": dests, "more": extra[:24],
             "total_feasible": len(scanned),
@@ -373,7 +404,9 @@ def _rule_rank_pipeline(s: S, prior_steps):
         out["message"] = "当前条件下没有可行的目的地，建议提高预算或放宽出行方式"
         return out
     ranked = tools.rank_destinations(None, scanned, req["budget"], req["days"],
-                                     req.get("prefs") or [])
+                                     req.get("prefs") or [],
+                                     meta=tools.date_meta(req.get("date"),
+                                                          req["days"]))
     out["ranked"], out["more"] = ranked[:6], ranked[6:30]
     out["total_feasible"] = len(feas)
     out["trace"] = steps + [_t("rank", "多因子打分排序",
@@ -403,7 +436,9 @@ def n_scan(s: S):
 def n_rank(s: S):
     req = s["req"]
     ranked = tools.rank_destinations(None, s["scanned"], req["budget"], req["days"],
-                                     req.get("prefs") or [])
+                                     req.get("prefs") or [],
+                                     meta=tools.date_meta(req.get("date"),
+                                                          req["days"]))
     return {"ranked": ranked[:6], "more": ranked[6:30],
             "total_feasible": sum(1 for x in s["scanned"] if x["feasible"]),
             "trace": [_t("rank", "多因子打分排序",
@@ -441,6 +476,7 @@ def n_agent_plan(s: S):
     user_msg = json.dumps({
         "出发地": origin["name"], "目的地": req["dest"], "预算": req["budget"],
         "天数": req["days"], "出行方式": req.get("transport", "auto"),
+        "出发日期": _date_ctx(req),
         "偏好": req.get("prefs") or [], "当前月份": datetime.now().month,
     }, ensure_ascii=False)
 
@@ -463,11 +499,13 @@ def n_agent_plan(s: S):
                                "resolved_mode": req.get("transport", "auto")},
                     "judge_engine": "rule-fallback", "tool_data": tool_data,
                     "trace": steps}
-        intel = tools.fetch_intel(None, req["dest"])
-        judged = tools.judge_intel(None, intel, req["days"], req.get("prefs") or [])
+        intel = tools.fetch_intel(None, req["dest"], date=req.get("date"))
+        judged = tools.judge_intel(None, intel, req["days"],
+                                   req.get("prefs") or [], date=req.get("date"))
         result = tools.compose_plans(None, origin, req["dest"], req["budget"],
                                      req["days"], req.get("transport", "auto"),
-                                     req.get("prefs") or [], judged)
+                                     req.get("prefs") or [], judged,
+                                     date=req.get("date"))
         return {"intel": intel, "judged": judged, "result": result,
                 "guide": tools.build_guide(kb, intel, judged,
                                            tool_data=tool_data,
@@ -534,11 +572,13 @@ def n_assemble(s: S):
         })
 
     if len(plans) < 3 and kb:                    # 知识库城市 → 规则兜底
-        intel = tools.fetch_intel(None, req["dest"])
-        judged = tools.judge_intel(None, intel, req["days"], req.get("prefs") or [])
+        intel = tools.fetch_intel(None, req["dest"], date=req.get("date"))
+        judged = tools.judge_intel(None, intel, req["days"],
+                                   req.get("prefs") or [], date=req.get("date"))
         result = tools.compose_plans(None, origin, req["dest"], req["budget"],
                                      req["days"], req.get("transport", "auto"),
-                                     req.get("prefs") or [], judged)
+                                     req.get("prefs") or [], judged,
+                                     date=req.get("date"))
         return {"intel": intel, "judged": judged, "result": result,
                 "guide": tools.build_guide(kb, intel, judged,
                                            tool_data=tool_data,
@@ -554,9 +594,15 @@ def n_assemble(s: S):
         if qs:
             intel["scenic_qunar"] = qs["scenic"]
             intel["sources"].append("去哪儿票价")
+    meta = tools.date_meta(req.get("date"), req["days"])
+    if meta and not intel.get("weather_fore"):  # 模型没查预报 → 补拉
+        fc = apis.weather_forecast(c["name"])
+        if fc:
+            intel["weather_fore"] = fc
     dropped = [{"name": d.name, "reason": (d.reason or "")[:30]}
                for d in (getattr(out, "dropped", None) or [])]
     notes = [str(n)[:60] for n in (getattr(out, "notes", None) or [])][:5]
+    notes += tools.date_notes(meta, tools.trip_forecast(intel, meta))
     notes += tools._base_notes(intel)
     judged = {"notes": notes, "dropped": dropped,
               "tips": c["tips"], "foods": c["foods"][:5], "kept": []}
@@ -580,10 +626,14 @@ def n_assemble(s: S):
 
 
 def _resolve_transport(origin, c, req, tool_data):
-    """优先用模型查到的 12306 往返真实车次；模型没查则代码补查，最终兜底估算。"""
+    """优先用模型查到的 12306 往返真实车次；模型没查则代码补查，最终兜底估算。
+    指定出发日时按 出发日/出发日+天数-1 分别查去程与回程。"""
     km = geo.haversine_km(origin["lat"], origin["lng"], c["lat"], c["lng"])
     est = geo.estimate_transport(km, req.get("transport", "auto"), c)
     mode = est["mode"]
+    meta = tools.date_meta(req.get("date"), req["days"])
+    dep_d = meta["date"] if meta else None
+    ret_d = meta["ret"] if meta else None
     if mode != "train":
         return ({"mode": mode, "src": "model", "hours": est.get("hours"),
                  "cost": est["cost"],
@@ -595,7 +645,7 @@ def _resolve_transport(origin, c, req, tool_data):
     fo = td.get("outbound") if isinstance(td, dict) else None
     ro = td.get("return") if isinstance(td, dict) else None
     if not (fo and fo.get("trains")):                # 模型没查去程 → 代码补查
-        d = apis.query_trains(origin["name"], c["name"])
+        d = apis.query_trains(origin["name"], c["name"], dep_d)
         if d:
             fo = {"date": d["date"], "trains": [
                 {"code": t["code"], "kind": t["kind"], "from": t["from"],
@@ -604,7 +654,7 @@ def _resolve_transport(origin, c, req, tool_data):
                  "二等座": (apis.train_price(t) or {}).get("二等座")}
                 for t in d["trains"][:5]]}
     if not (ro and ro.get("trains")):                # 回程同理补查
-        d = apis.query_trains(c["name"], origin["name"])
+        d = apis.query_trains(c["name"], origin["name"], ret_d)
         if d:
             ro = {"date": d["date"], "trains": [
                 {"code": t["code"], "kind": t["kind"], "from": t["from"],
@@ -628,7 +678,8 @@ def _resolve_transport(origin, c, req, tool_data):
              "outbound": f"{ob['code']} {ob['from']}{ob['dep']}→{ob['to']}{ob['arr']}",
              "back": (f"{bk['code']} {bk['from']}{bk['dep']}→{bk['to']}{bk['arr']}"
                       if bk else "返程车次请到12306查询"),
-             "trains": fo["trains"][:6], "query_date": fo.get("date", "")},
+             "trains": fo["trains"][:6], "query_date": fo.get("date", ""),
+             "ret_date": (ro or {}).get("date")},
             km, mode)
 
 
@@ -720,6 +771,8 @@ def _intel_from_tools(c, tool_data):
     if isinstance(td, dict):
         if td.get("weather"):
             intel["weather"] = td["weather"]; intel["sources"].append("高德天气")
+        if td.get("forecast"):
+            intel["weather_fore"] = td["forecast"]
         if td.get("pois_scenic"):
             intel["pois_scenic"] = td["pois_scenic"]
             intel["sources"].append("高德POI")
@@ -755,7 +808,7 @@ def _compose_trace(result, req):
 # 规则流水线节点（无 key 时使用）---------------------------------------------
 
 def n_fetch_intel(s: S):
-    intel = tools.fetch_intel(None, s["req"]["dest"])
+    intel = tools.fetch_intel(None, s["req"]["dest"], date=s["req"].get("date"))
     return {"intel": intel,
             "trace": [_t("search", f"搜索「{s['req']['dest']}」当地特色与攻略",
                          "数据来源：" + " + ".join(intel["sources"]))]}
@@ -763,7 +816,8 @@ def n_fetch_intel(s: S):
 
 def n_judge_rule(s: S):
     req = s["req"]
-    judged = tools.judge_intel(None, s["intel"], req["days"], req.get("prefs") or [])
+    judged = tools.judge_intel(None, s["intel"], req["days"],
+                               req.get("prefs") or [], date=req.get("date"))
     kept_n, drop_n = len(judged["kept"]), len(judged["dropped"])
     why = "；".join(d["reason"] for d in judged["dropped"][:2]) or "无"
     return {"judged": judged, "judge_engine": "rule",
@@ -775,7 +829,8 @@ def n_compose(s: S):
     req = s["req"]
     result = tools.compose_plans(None, s["origin"], req["dest"], req["budget"],
                                  req["days"], req.get("transport", "auto"),
-                                 req.get("prefs") or [], s["judged"])
+                                 req.get("prefs") or [], s["judged"],
+                                 date=req.get("date"))
     c = next((x for x in tools.load_cities()
               if x["name"] == req["dest"].rstrip("市")), None) \
         or _pseudo_city(req["dest"])

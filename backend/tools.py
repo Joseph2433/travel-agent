@@ -7,6 +7,7 @@ from datetime import datetime
 
 import apis
 import geo
+from datetime import timedelta
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 _cities_cache = None
@@ -144,8 +145,92 @@ def trending_cities(ttl=600):
     return names
 
 
-def rank_destinations(ctx, scanned, budget, days, prefs):
-    """多因子打分：预算契合 + 天数匹配 + 季节适宜 + 偏好命中 + 距离效率 + 热榜。"""
+# 出行日期因素：固定假 + 农历假年表（近似调休区间，仅用于提示/打分微调）
+_HOLI_FIXED = [((1, 1), (1, 1), "元旦"), ((5, 1), (5, 5), "劳动节"),
+               ((10, 1), (10, 7), "国庆")]
+_HOLI_LUNAR = {
+    2025: [((1, 28), (2, 4), "春节"), ((4, 4), (4, 6), "清明"),
+           ((5, 31), (6, 2), "端午"), ((10, 6), (10, 6), "中秋")],
+    2026: [((2, 16), (2, 22), "春节"), ((4, 4), (4, 6), "清明"),
+           ((6, 19), (6, 21), "端午"), ((9, 25), (9, 27), "中秋")],
+    2027: [((2, 5), (2, 11), "春节"), ((4, 4), (4, 6), "清明"),
+           ((6, 9), (6, 11), "端午"), ((9, 15), (9, 17), "中秋")],
+}
+
+
+def date_meta(date_str, days=1):
+    """出发日期画像：星期/是否撞假期或周末/距今天数/12306预售期/预报可及性。
+    无效或过去日期返回 None（调用方按未指定处理）。"""
+    if not date_str:
+        return None
+    try:
+        dep = datetime.strptime(str(date_str)[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+    today = datetime.now().date()
+    away = (dep - today).days
+    if away < 0:
+        return None
+    days = max(1, int(days or 1))
+    ret = dep + timedelta(days=days - 1)
+    trip = [dep + timedelta(days=i) for i in range(days)]
+
+    def _mdhit(d, a, b):          # (月,日) 落区间，兼容跨年段
+        md = (d.month, d.day)
+        return a <= md <= b if a <= b else (md >= a or md <= b)
+
+    holiday = None
+    for a, b, n in _HOLI_FIXED + _HOLI_LUNAR.get(dep.year, []):
+        if any(_mdhit(d, a, b) for d in trip):
+            holiday = n
+            break
+    weekend = any(d.weekday() >= 5 for d in trip) or dep.weekday() == 4
+    return {"date": dep.isoformat(), "ret": ret.isoformat(),
+            "weekday": dep.weekday(), "away": away,
+            "holiday": holiday, "weekend": weekend,
+            "rail_sale": away <= 13,          # 12306预售期约15天(浮动，留余量)
+            "fc_range": away <= 3,            # 高德逐日预报仅覆盖今天起4天
+            "label": f"{dep.month}月{dep.day}日"
+                     f"·周{'一二三四五六日'[dep.weekday()]}"}
+
+
+def trip_forecast(intel, meta):
+    """从 intel.weather_fore 中筛出行程窗口（出发日~返程日）内的逐日预报。"""
+    if not meta:
+        return None
+    fore = [c for c in (intel.get("weather_fore") or [])
+            if meta["date"] <= (c.get("date") or "") <= meta["ret"]]
+    return fore or None
+
+
+def date_notes(meta, fore=None):
+    """出发日期衍生的出行提示：假期高峰 / 周末 / 预售期 / 逐日天气。"""
+    if not meta:
+        return []
+    tags = []
+    if meta["holiday"]:
+        tags.append(meta["holiday"] + "假期")
+    elif meta["weekend"]:
+        tags.append("周末档")
+    head = f"出发日 {meta['label']}" + ("·" + "·".join(tags) if tags else "")
+    if meta["holiday"] or meta["weekend"]:
+        head += "，客流高峰车票住宿建议尽早订"
+    notes = [head]
+    if not meta["rail_sale"]:
+        notes.append("距出发超12306预售期(约15天)，车次票价为估算，开售后再核验")
+    if fore:
+        seg = "、".join(f"{(c.get('date') or '')[5:].replace('-', '/')}"
+                        f"{c.get('day')}{c.get('lo')}~{c.get('hi')}°C"
+                        for c in fore)
+        notes.append("行程天气：" + seg)
+    elif not meta["fc_range"]:
+        notes.append("出发日较远暂无逐日预报，出发前3天可再看天气")
+    return notes
+
+
+def rank_destinations(ctx, scanned, budget, days, prefs, meta=None):
+    """多因子打分：预算契合 + 天数匹配 + 季节适宜 + 偏好命中 + 距离效率 + 热榜
+    + 出发日因素（节假日/周末高峰 → 短途圈加分、长线标注票紧）。"""
     month = datetime.now().month
     cities = {c["name"]: c for c in load_cities()}
     trending = trending_cities()
@@ -190,6 +275,13 @@ def rank_destinations(ctx, scanned, budget, days, prefs):
         # 热榜（10）：目的地正挂在微博/抖音/小红书热搜上
         if s["city"] in trending:
             score += 10; reasons.append("近期全网热议")
+        # 出发日因素：假期/周末高峰 → 短途圈更稳，长线标注票紧
+        if meta and (meta.get("holiday") or meta.get("weekend")):
+            tag = meta.get("holiday") or "周末"
+            if h <= 4:
+                score += 4; reasons.append(f"{tag}短途圈·票源相对稳")
+            elif h >= 7:
+                reasons.append(f"{tag}长线·车票紧俏需早订")
         scored.append({
             "city": c["name"], "province": c["province"], "score": round(score),
             "km": s["km"], "lat": c["lat"], "lng": c["lng"],
@@ -204,8 +296,8 @@ def rank_destinations(ctx, scanned, budget, days, prefs):
 _WINTER_MARK = ("冰雪大世界", "雪博会", "冰雪嘉年华")
 
 
-def fetch_intel(ctx, city_name):
-    """目的地情报搜索：高德POI + 天气 + 网页攻略 + 本地知识库，多源融合。"""
+def fetch_intel(ctx, city_name, date=None):
+    """目的地情报搜索：高德POI + 天气(+指定日期的逐日预报) + 网页攻略 + 本地知识库。"""
     c = next(x for x in load_cities() if x["name"] == city_name)
     intel = {"city": c, "sources": ["本地知识库"], "pois_scenic": None,
              "pois_food": None, "weather": None, "web": None,
@@ -213,6 +305,10 @@ def fetch_intel(ctx, city_name):
     w = apis.weather_live(c["name"])
     if w:
         intel["weather"] = w; intel["sources"].append("高德天气")
+    if date:                                   # 给了出发日 → 拉逐日预报（近4天）
+        fc = apis.weather_forecast(c["name"])
+        if fc:
+            intel["weather_fore"] = fc
     scenic = apis.poi_search(c["name"], "景点", "110000", 8)
     if scenic and scenic["pois"]:
         intel["pois_scenic"] = scenic["pois"]; intel["sources"].append("高德POI")
@@ -232,8 +328,9 @@ def fetch_intel(ctx, city_name):
     return intel
 
 
-def judge_intel(ctx, intel, days, prefs):
-    """对搜到的情报做判断：剔除不合时令/低价值项，按天数取舍，输出核心体验清单。"""
+def judge_intel(ctx, intel, days, prefs, date=None):
+    """对搜到的情报做判断：剔除不合时令/低价值项，按天数取舍，输出核心体验清单。
+    date: 出发日 YYYY-MM-DD → 生成假期/预售/逐日天气提示。"""
     c, month = intel["city"], datetime.now().month
     kept, dropped, notes = [], [], []
     for a in c["attractions"]:
@@ -251,6 +348,8 @@ def judge_intel(ctx, intel, days, prefs):
     kept = kept[:cap]
     for a in overflow:
         dropped.append({"name": a["n"], "reason": "天数内排不下，忍痛割爱"})
+    meta = date_meta(date, days)
+    notes = date_notes(meta, trip_forecast(intel, meta))
     notes += _base_notes(intel)
     return {"kept": kept, "dropped": dropped, "notes": notes,
             "foods": c["foods"][:5], "tips": c["tips"],
@@ -317,34 +416,41 @@ def apply_llm_judge(intel, days, prefs, llm_out):
             "qunar_scenic": intel.get("scenic_qunar") or []}
 
 
-def _real_rail(origin_name, dest_name):
-    """查12306真实车次，选去程(最早出发)/回程(最晚出发)各一班。"""
-    data = apis.query_trains(origin_name, dest_name)
+def _real_rail(origin_name, dest_name, dep_date=None, ret_date=None):
+    """查12306真实车次，选去程(最早出发)/回程(最晚出发)各一班。
+    dep_date/ret_date: YYYY-MM-DD，None 用接口默认（预售期第7天）。"""
+    data = apis.query_trains(origin_name, dest_name, dep_date)
     if not data or not data["trains"]:
         return None
     hs = [t for t in data["trains"] if t["kind"] == "高铁"]
     trains = hs or data["trains"]
     outbound = min(trains, key=lambda t: t.get("dep") or "99:99")  # 最早出发
     ret = outbound
-    back = apis.query_trains(dest_name, origin_name)               # 回程反方向查
+    back = apis.query_trains(dest_name, origin_name, ret_date)   # 回程反方向查
     if back and back["trains"]:
         hb = [t for t in back["trains"] if t["kind"] == "高铁"] or back["trains"]
         ret = max(hb, key=lambda t: t.get("dep") or "")            # 最晚返程
     price = apis.train_price(outbound) or {}
-    return {"date": data["date"], "all": trains,
+    return {"date": data["date"], "ret_date": (back or {}).get("date"),
+            "all": trains,
             "outbound": outbound, "return": ret,
             "price_2nd": price.get("二等座"), "price_1st": price.get("一等座"),
             "src": "12306"}
 
 
-def compose_plans(ctx, origin, dest_name, budget, days, transport, prefs, judged):
-    """编排 3-5 套差异化行程方案。"""
+def compose_plans(ctx, origin, dest_name, budget, days, transport, prefs,
+                  judged, date=None):
+    """编排 3-5 套差异化行程方案。date: 出发日 YYYY-MM-DD（可选）。"""
     c = next(x for x in load_cities() if x["name"] == dest_name)
     km = geo.haversine_km(origin["lat"], origin["lng"], c["lat"], c["lng"])
 
     trans = geo.estimate_transport(km, transport, c)
     resolved_mode = trans["mode"]
-    rail = _real_rail(origin["name"], c["name"]) if resolved_mode == "train" else None
+    meta = date_meta(date, days)
+    dep_d = meta["date"] if meta else None      # 去程=出发日
+    ret_d = meta["ret"] if meta else None       # 回程=行程最后一天
+    rail = _real_rail(origin["name"], c["name"], dep_d, ret_d) \
+        if resolved_mode == "train" else None
 
     if rail and resolved_mode == "train":
         one_way = rail["price_2nd"] or trans["cost"]
@@ -357,6 +463,7 @@ def compose_plans(ctx, origin, dest_name, budget, days, transport, prefs, judged
                         "hours": t["hours"], "from": t["from"], "to": t["to"],
                         "seats": t["seats"]} for t in rail["all"][:6]],
             "query_date": rail["date"],
+            "ret_date": rail.get("ret_date"),
         }
     else:
         transport_info = {

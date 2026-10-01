@@ -81,7 +81,8 @@ def get_city_intel(city: str):
     网络攻略摘要（含小红书被索引的笔记）。POI/景点名称可作为行程候选，
     去哪儿 ticket 字段是真实票价，编排预算时优先用它而不是估算。"""
     name = city.rstrip("市")
-    out = {"city": name, "weather": apis.weather_live(name)}
+    out = {"city": name, "weather": apis.weather_live(name),
+           "forecast": apis.weather_forecast(name)}   # 近4天逐日预报[{date,day,night,hi,lo}]
     ps = _poi_rows(apis.poi_search(name, "景点", "110000", 8))
     if ps:
         out["pois_scenic"] = ps
@@ -168,11 +169,15 @@ def travel_trends(boards: list = None, count: int = 10):
 
 
 @tool
-def query_trains(from_city: str, to_city: str):
-    """查询12306往返真实车次（预售期第7天）。返回去程 outbound 与回程 return
-    两个方向各自的车次列表：车次/出发站到达站/发时到时/历时h/余票/二等座一等座票价。"""
-    def leg(a, b):
-        d = apis.query_trains(a, b)
+def query_trains(from_city: str, to_city: str,
+                 dep_date: str = "", ret_date: str = ""):
+    """查询12306往返真实车次余票。dep_date/ret_date 传 YYYY-MM-DD
+    （去程=出发日，回程=出发日+行程天数-1）；留空默认预售期内第7天。
+    超出12306预售期（约15天）查不到就改用 estimate_transport 并在结论中说明。
+    返回去程 outbound 与回程 return 各自车次列表：车次/出发站到达站/
+    发时到时/历时h/余票/二等座一等座票价。"""
+    def leg(a, b, dt):
+        d = apis.query_trains(a, b, dt or None)
         if not d:
             return None
         rows = [{"code": t["code"], "kind": t["kind"], "from": t["from"],
@@ -184,7 +189,8 @@ def query_trains(from_city: str, to_city: str):
             p = apis.train_price(t) or {}
             row["二等座"], row["一等座"] = p.get("二等座"), p.get("一等座")
         return {"date": d["date"], "trains": rows}
-    out = {"outbound": leg(from_city, to_city), "return": leg(to_city, from_city)}
+    out = {"outbound": leg(from_city, to_city, dep_date),
+           "return": leg(to_city, from_city, ret_date)}
     if not out["outbound"] and not out["return"]:
         return _j({"error": "查无车次或接口不可用"})
     return _j(out)

@@ -1,5 +1,6 @@
 /* ═══════════ 旅图 TravelAgent 前端逻辑 ═══════════ */
 const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
 const state = { origin: null, dests: [], plans: [], intel: null, map: null };
 
 const ICONS = { pin:"◎", scan:"◈", rank:"✦", search:"⌕", judge:"⚖", rail:"⇄", plan:"▤", brain:"❖", pen:"✎", think:"✧", tool:"⚙", observe:"◉" };
@@ -89,7 +90,7 @@ function collectParams(){
     budget: +$("#budget").value,
     days: state.getDays(),
     transport: $("#chipsTransport .chip.on").dataset.v,
-    prefs: [...$("#chipsPrefs .chip.on")].map(c => c.dataset.v),
+    prefs: $$("#chipsPrefs .chip.on").map(c => c.dataset.v),
   };
 }
 

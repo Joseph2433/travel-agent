@@ -198,7 +198,7 @@ def rank_destinations(ctx, scanned, budget, days, prefs):
             "hotelPerNight": c["hotelPerNight"],
         })
     scored.sort(key=lambda x: -x["score"])
-    return scored[:6]
+    return scored
 
 
 _WINTER_MARK = ("冰雪大世界", "雪博会", "冰雪嘉年华")
@@ -225,6 +225,10 @@ def fetch_intel(ctx, city_name):
     web = apis.web_search_snippets(f"{c['name']}旅游攻略 必去景点 美食")
     if web:
         intel["web"] = web; intel["sources"].append("网页搜索")
+    if apis.xhs_enabled():
+        res = apis.xhs_search_notes(f"{c['name']} 旅游攻略", limit=4)
+        if res and res.get("notes"):
+            intel["xhs"] = res["notes"]; intel["sources"].append("小红书")
     return intel
 
 
@@ -374,6 +378,7 @@ def compose_plans(ctx, origin, dest_name, budget, days, transport, prefs, judged
         plan = _build_plan(t, c, origin, kept, foods, days,
                            transport_info, budget, prefs,
                            qunar=judged.get("qunar_scenic"))
+        plan["guide"] = build_plan_guide(plan, judged)
         plans.append(plan)
     return {"plans": plans, "transport": transport_info, "km": km,
             "resolved_mode": resolved_mode}
@@ -525,3 +530,170 @@ def _day_title(d, days, picked):
     if picked:
         return picked[0]["n"].split("-")[0].split("(")[0][:8] + " 一线"
     return "自由探索"
+
+
+# ----------------------------------------------------------- 详细攻略 ----
+
+def build_guide(c, intel, judged, tool_data=None, transport=None):
+    """组装「目的地详细攻略」：小红书笔记骨架 → 去哪儿票价 → 美食 → 贴士 → 来源。
+    全部内容来自工具/接口真实返回，代码只做取舍与去重，不生成文本。
+    item 结构统一为 {title, meta, url, excerpt}（后端字段，前端负责排版）。"""
+    sections = []
+
+    # ① 攻略灵感：小红书真实笔记（LLM路径从 tool_data 收，规则路径从 intel 直收）
+    notes = []
+    for td in (tool_data or {}).get("search_xhs_notes") or []:
+        if isinstance(td, dict):
+            notes.extend(td.get("notes") or [])
+    notes.extend(intel.get("xhs") or [])
+    seen, xhs_items = set(), []
+    for n in notes:
+        t = (n.get("title") or "").strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        xhs_items.append({"title": t[:42],
+                          "meta": f"赞{n.get('likes', '0')}"
+                                  + (f" · 藏{n['collects']}" if n.get("collects") else "")
+                                  + f" · @{n.get('author', '')}",
+                          "url": n.get("url") or "",
+                          "excerpt": (n.get("excerpt") or "")[:120]})
+    if xhs_items:
+        sections.append({"icon": "📕", "title": "攻略灵感 · 小红书真实笔记",
+                         "items": xhs_items[:6]})
+
+    # ② 景点与门票：去哪儿在售真实票价
+    scenic = intel.get("scenic_qunar") or []
+    if scenic:
+        items = []
+        for s in scenic[:8]:
+            meta = " · ".join(x for x in [
+                (s["star"] + "景区") if s.get("star") else "",
+                f"评分{s['score']}" if s.get("score") else "",
+                "免费" if not s.get("ticket") else f"¥{s['ticket']:g}",
+                f"月销{s['sales']}" if s.get("sales") else ""] if x)
+            items.append({"title": s["name"], "meta": meta,
+                          "excerpt": s.get("intro") or ""})
+        sections.append({"icon": "🎫", "title": "景点与门票 · 去哪儿实时在售",
+                         "items": items})
+
+    # ③ 本地风味：知识库特色美食 + 高德美食POI
+    food_items = [{"title": f["n"], "meta": f"约¥{f['p']}", "excerpt": f["d"]}
+                  for f in (judged.get("foods") or [])]
+    for p in (intel.get("pois_food") or [])[:4]:
+        food_items.append({"title": p["name"],
+                           "meta": f"评分{p.get('rating') or '—'}"
+                                   + (f" · 人均¥{p['cost']}" if p.get("cost") else ""),
+                           "excerpt": (p.get("addr") or "")[:30]})
+    if food_items:
+        sections.append({"icon": "🍜", "title": "本地风味 · 特色与热门店",
+                         "items": food_items[:8]})
+
+    # ④ 大交通：12306 真实车次或估算
+    if transport and transport.get("outbound"):
+        items = [{"title": transport["outbound"], "meta": "去程"},
+                 {"title": transport["back"], "meta": "回程"}]
+        for tr in (transport.get("trains") or [])[:4]:
+            seat = (tr.get("seats") or {}).get("二等座")
+            items.append({"title": f"{tr['code']}　{tr['from']}→{tr['to']}",
+                          "meta": f"{tr['dep']}–{tr['arr']} · {tr['hours']}h"
+                                  + (f" · 二等座{seat}" if seat else "")})
+        sections.append({"icon": "🚄",
+                         "title": "大交通 · " + ("12306 实时余票"
+                                 if transport.get("src") == "12306" else "估算参考"),
+                         "items": items})
+
+    # ⑤ 贴士与避雷：知识库贴士 + 引擎提示 + 笔记热评摘录
+    tips = []
+    for x in (judged.get("tips") or []) + (judged.get("notes") or []):
+        if x and x not in tips:
+            tips.append(x)
+    for n in notes:
+        for cm in (n.get("hot_comments") or [])[:1]:
+            txt = f"小红书热评：{cm}"
+            if txt not in tips:
+                tips.append(txt)
+    if tips:
+        sections.append({"icon": "⚠️", "title": "贴士与避雷",
+                         "items": [{"title": t} for t in tips[:8]]})
+
+    # ⑥ 参考来源：攻略网页 + 笔记链接
+    links, seen_u = [], set()
+    for w in (intel.get("web") or []):
+        u = w.get("url") or ""
+        if u and u not in seen_u:
+            seen_u.add(u)
+            links.append({"title": w.get("title") or u, "url": u,
+                          "meta": {"web": "网页", "xhs-web": "小红书(被索引)",
+                                   "xiaohongshu": "小红书"}.get(w.get("src"),
+                                                              "网页")})
+    for n in xhs_items:
+        if n["url"] and n["url"] not in seen_u:
+            seen_u.add(n["url"])
+            links.append({"title": n["title"], "url": n["url"],
+                          "meta": "小红书"})
+    if links:
+        sections.append({"icon": "🔗", "title": "参考来源", "items": links[:10]})
+
+    return {"dest": c["name"], "sections": sections}
+
+
+def _cost_txt(cost):
+    return f"¥{cost:g}" if isinstance(cost, (int, float)) and cost else ""
+
+
+def build_plan_guide(plan, judged=None):
+    """为单套方案生成「详细攻略」正文（markdown-lite：###小节 / -列表 / **重点**）。
+    模型没写 guide 时的确定性兜底：只复述工具数据里已有的信息——
+    行程项本身、去哪儿真实票价、知识库贴士与提示，不新造内容。"""
+    judged = judged or {}
+    scenic = judged.get("qunar_scenic") or []
+    days = plan.get("days") or []
+    lines = []
+
+    if days:
+        lines.append("### 路线速览")
+        for d in days:
+            spots = [i["name"] for i in d.get("items", [])
+                     if i.get("type") in ("景点", "美食", "休闲")]
+            seg = " → ".join(spots[:5]) or "机动安排"
+            lines.append(f"- **D{d.get('day')} {d.get('title', '')}**：{seg}")
+
+    fee, seen = [], set()
+    for d in days:
+        for i in d.get("items", []):
+            name = i.get("name") or ""
+            if i.get("type") != "景点" or name in seen:
+                continue
+            seen.add(name)
+            real = _qunar_price(name, scenic)
+            if real is not None:
+                fee.append(f"- {name}：去哪儿在售 **¥{real:g}**")
+            elif i.get("cost"):
+                fee.append(f"- {name}：参考门票 {_cost_txt(i['cost'])}")
+            else:
+                fee.append(f"- {name}：免费开放")
+    if fee:
+        lines.append("### 门票与预约")
+        lines.extend(fee[:8])
+        lines.append("- 旺季/节假日建议提前 1-3 天在官方公众号或 OTA 预约购票")
+
+    eats = [i for d in days for i in d.get("items", [])
+            if i.get("type") == "美食"]
+    if eats:
+        lines.append("### 吃什么")
+        for i in eats[:6]:
+            cost = _cost_txt(i.get("cost"))
+            lines.append(f"- **{i['name']}**："
+                         + (f"{cost} · " if cost else "")
+                         + (i.get("note") or "当地特色")[:40])
+
+    tips = []
+    for x in (judged.get("tips") or []) + (judged.get("notes") or []):
+        if x and x not in tips:
+            tips.append(x)
+    if tips:
+        lines.append("### 行前贴士")
+        lines.extend(f"- {t}" for t in tips[:6])
+
+    return "\n".join(lines)

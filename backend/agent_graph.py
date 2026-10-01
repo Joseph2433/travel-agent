@@ -32,9 +32,12 @@ class S(TypedDict, total=False):
     origin: dict
     scanned: list
     ranked: list
+    more: list                      # 精选 6 个之外的其余可达候选（查看更多）
+    total_feasible: int
     verdict: dict
     intel: dict
     judged: dict
+    guide: dict                     # 目的地详细攻略（多源交叉验证组装）
     judge_engine: str               # llm-agent | rule | rule-fallback
     agent_out: object               # LLM 结构化输出（PlansOut/RecOut 实例）
     result: dict                    # {plans, transport, km, resolved_mode}
@@ -106,8 +109,10 @@ REC_PROMPT = """你是「旅图」旅行规划 Agent 的目的地决策大脑。
    in_kb=true 是知识库精选城市；in_kb=false 是其他城市（包括小众目的地）——
    两者都可推荐，别只挑热门
 2) 对感兴趣的城市：知识库城调 get_city_profile 看景点/美食/佳季；
-   小众城市可改调 get_city_intel 看它的实时POI密度/天气/攻略热度再判断
-3) 综合维度：预算契合、天数匹配（每天约2-3个景点）、当前月份 vs 佳季、偏好命中、交通效率
+   小众城市可改调 get_city_intel 看它的实时POI密度/天气/攻略热度再判断；
+   还可调 travel_trends 看微博/抖音/小红书热搜，正在热议的目的地/玩法可优先
+3) 综合维度：预算契合、天数匹配（每天约2-3个景点）、当前月份 vs 佳季、偏好命中、
+   交通效率、热榜热度
 
 最后用 submit_result 提交，payload 结构：
 {"ranking":[{"city":"城市名","score":0-100整数,"comment":"≤25字点评"},...3-6条],
@@ -117,25 +122,38 @@ REC_PROMPT = """你是「旅图」旅行规划 Agent 的目的地决策大脑。
 
 PLAN_PROMPT = """你是「旅图」旅行规划 Agent 的行程编排大脑。
 
-工作方式：先用工具调研，推理编排，最后必须调用 submit_result 提交结论。
-1) get_city_profile 看目的地全部景点(名称/时长/门票/推荐度)、美食、贴士、消费档
-2) get_city_intel 拿实时天气、热门POI、网络攻略摘要；想参考小红书真实游客笔记
-   （美食店名/避雷/路线细节）可调 search_xhs_notes，未配置时跳过即可
-3) 出行方式为 train/auto 时调 query_trains 拿真实车次票价；其他方式调 estimate_transport
-4) 编排 3-5 套差异化方案（主题如：经典全景/寻味美食/深度慢游/精华快闪/舒适度假，可按目的地特点自由命名）：
+工作方式：严格按"攻略先行 → 多源验证 → 编排填充"的顺序调研，最后必须调用
+submit_result 提交结论。
+
+1) 攻略先行：优先调 search_xhs_notes 搜「目的地 旅游攻略」「目的地 N日游路线」
+   拿真实游客笔记作为攻略骨架（必去景点/必吃美食/避雷点/路线节奏）；需要深挖
+   店名或避雷细节时加 with_detail=true 拿正文摘录。小红书未配置时跳过，改看
+   get_city_intel 的网页攻略摘要。
+2) 骨架验证：get_city_profile 看知识库景点/美食/贴士/消费档；get_city_intel 拿
+   实时天气、高德POI、去哪儿真实票价(scenic_qunar.ticket 是真实挂牌价)。
+   笔记里出现的店名/景点，先用 search_pois 核实真实存在再编进方案；
+   需要特定类别（博物馆/夜市/古镇/亲子等）时用 search_pois 主动补充。
+3) 交通：出行方式为 train/auto 时调 query_trains 拿真实车次票价；
+   其他方式调 estimate_transport。
+4) 编排 3-5 套差异化方案（主题如：经典全景/寻味美食/深度慢游/精华快闪/舒适度假，
+   可按目的地特点自由命名）：
    - 每套 days 数量 = 用户天数；每天排 景点/美食/休闲 槽位（上午/下午/晚上/全天/午餐/晚餐）
    - 景点名可来自知识库 attractions 或 get_city_intel/search_pois 返回的高德POI名称；
      美食名可来自知识库 foods 或高德美食POI；都可混用，优先选评分高的真实POI
-   - 需要特定类别（博物馆/夜市/古镇/亲子等）时用 search_pois 主动搜索补充
    - 不要排往返交通项（系统会自动插入首尾两天）；抵达日少排点、返程日只排上午
    - hotel_factor(0.8穷游/1.0标准/1.3+舒适) 和 food_factor 用来区分方案档位
-   - 可以调 calc_budget 自检每套方案总价是否贴合预算
+   - 可以调 calc_budget 自检每套方案总价是否贴合预算，
+     门票优先用 scenic_qunar 的真实票价求和
 
 最后用 submit_result 提交，payload 结构：
 {"plans":[{"name":"≤8字方案名","pace":"节奏","desc":"≤25字定位","hotel_factor":1.0,
            "food_factor":1.0,"days":[{"day":1,"title":"当日标题","items":[
-           {"slot":"上午","type":"景点","name":"知识库中的精确名称"}]}]}],
- "notes":["出行提示3-5条"],"dropped":[{"name":"剔除景点名","reason":"理由"}]}
+           {"slot":"上午","type":"景点","name":"知识库中的精确名称"}]}],
+           "guide":"本套方案的详细攻略正文(###小节/-列表/**重点**，300-600字)：
+                    路线怎么玩、门票怎么约、美食去哪吃、避雷提醒——
+                    只写刚才工具调研核实过的信息，不编造店名和数字"}],
+ "notes":["出行提示3-5条，注明源自攻略还是实况"],
+ "dropped":[{"name":"剔除景点名","reason":"理由"}]}
 
 硬约束：真实景点/美食名只能从工具数据中选，不要编造。"""
 
@@ -298,7 +316,14 @@ def n_agent_rank(s: S):
     steps.append(_t("brain", "LLM 决策完成",
                     f"调研 {len([m for m in msgs if getattr(m,'type','')=='tool'])} 次工具，"
                     f"首推「{verdict['pick'] or dests[0]['city']}」"))
-    return {"ranked": dests, "verdict": verdict, "trace": steps}
+    picked = {d["city"] for d in dests}
+    extra = [r for r in tools.rank_destinations(
+                 None, list(scanned.values()), req["budget"], req["days"],
+                 req.get("prefs") or [])
+             if r["city"] not in picked]
+    return {"ranked": dests, "more": extra[:24],
+            "total_feasible": len(scanned),
+            "verdict": verdict, "trace": steps}
 
 
 def _rule_reasons(sc, c, req):
@@ -333,7 +358,8 @@ def _rule_rank_pipeline(s: S, prior_steps):
         return out
     ranked = tools.rank_destinations(None, scanned, req["budget"], req["days"],
                                      req.get("prefs") or [])
-    out["ranked"] = ranked
+    out["ranked"], out["more"] = ranked[:6], ranked[6:30]
+    out["total_feasible"] = len(feas)
     out["trace"] = steps + [_t("rank", "多因子打分排序",
                               "、".join(f"{r['city']}({r['score']})" for r in ranked[:5]))]
     return out
@@ -362,7 +388,8 @@ def n_rank(s: S):
     req = s["req"]
     ranked = tools.rank_destinations(None, s["scanned"], req["budget"], req["days"],
                                      req.get("prefs") or [])
-    return {"ranked": ranked,
+    return {"ranked": ranked[:6], "more": ranked[6:30],
+            "total_feasible": sum(1 for x in s["scanned"] if x["feasible"]),
             "trace": [_t("rank", "多因子打分排序",
                          "、".join(f"{r['city']}({r['score']})" for r in ranked[:5]))]}
 
@@ -425,6 +452,9 @@ def n_agent_plan(s: S):
                                      req["days"], req.get("transport", "auto"),
                                      req.get("prefs") or [], judged)
         return {"intel": intel, "judged": judged, "result": result,
+                "guide": tools.build_guide(kb, intel, judged,
+                                           tool_data=tool_data,
+                                           transport=result.get("transport")),
                 "judge_engine": "rule-fallback", "tool_data": tool_data,
                 "trace": steps + _compose_trace(result, req)}
 
@@ -481,6 +511,7 @@ def n_assemble(s: S):
         plans.append({
             "id": f"agent{i}", "name": p.name[:12], "desc": (p.desc or "")[:30],
             "pace": (p.pace or "适中")[:6], "days": days_out,
+            "guide": (getattr(p, "guide", "") or "")[:2500],
             "transport": transport, "budget": b, "fits_budget": not over,
             "over_hint": f"约超¥{b['total'] - req['budget']}，建议降低住宿或餐饮档位" if over else "",
         })
@@ -492,12 +523,20 @@ def n_assemble(s: S):
                                      req["days"], req.get("transport", "auto"),
                                      req.get("prefs") or [], judged)
         return {"intel": intel, "judged": judged, "result": result,
+                "guide": tools.build_guide(kb, intel, judged,
+                                           tool_data=tool_data,
+                                           transport=result.get("transport")),
                 "judge_engine": "rule-fallback",
                 "trace": [_t("judge", "方案校验", "LLM 方案不足3套，转规则编排")
                           ] + _compose_trace(result, req)}
 
     # 组装 intel（供前端情报条）：数据来自 ReAct 工具调用的真实返回
     intel = _intel_from_tools(c, tool_data)
+    if not intel.get("scenic_qunar"):          # 模型没查去哪儿 → 代码补拉兜底
+        qs = apis.qunar_scenic(c["name"], 8)
+        if qs:
+            intel["scenic_qunar"] = qs["scenic"]
+            intel["sources"].append("去哪儿票价")
     dropped = [{"name": d.name, "reason": (d.reason or "")[:30]}
                for d in (getattr(out, "dropped", None) or [])]
     notes = [str(n)[:60] for n in (getattr(out, "notes", None) or [])][:5]
@@ -506,8 +545,15 @@ def n_assemble(s: S):
               "tips": c["tips"], "foods": c["foods"][:5], "kept": []}
     result = {"plans": plans[:5], "transport": transport, "km": km,
               "resolved_mode": mode}
+    for pl in result["plans"]:
+        if not pl.get("guide"):              # 模型没写攻略 → 确定性兜底组装
+            pl["guide"] = tools.build_plan_guide(
+                pl, dict(judged,
+                         qunar_scenic=intel.get("scenic_qunar") or []))
+    guide = tools.build_guide(c, intel, judged, tool_data=tool_data,
+                              transport=transport)
     return {"intel": intel, "judged": judged, "result": result,
-            "judge_engine": "llm-agent",
+            "guide": guide, "judge_engine": "llm-agent",
             "trace": [_t("judge", "LLM 编排完成",
                          f"{len(plans)} 套方案通过校验，"
                          f"剔除 {len(dropped)} 项")
@@ -660,7 +706,10 @@ def _intel_from_tools(c, tool_data):
         if td.get("pois_scenic"):
             intel["pois_scenic"] = td["pois_scenic"]
             intel["sources"].append("高德POI")
+        if td.get("pois_food"):
+            intel["pois_food"] = td["pois_food"]
         if td.get("scenic_qunar"):
+            intel["scenic_qunar"] = td["scenic_qunar"]
             intel["sources"].append("去哪儿票价")
         if td.get("web"):
             intel["web"] = list(td["web"]); intel["sources"].append("网页搜索")
@@ -710,7 +759,13 @@ def n_compose(s: S):
     result = tools.compose_plans(None, s["origin"], req["dest"], req["budget"],
                                  req["days"], req.get("transport", "auto"),
                                  req.get("prefs") or [], s["judged"])
-    return {"result": result, "trace": _compose_trace(result, req)}
+    c = next((x for x in tools.load_cities()
+              if x["name"] == req["dest"].rstrip("市")), None) \
+        or _pseudo_city(req["dest"])
+    guide = tools.build_guide(c, s["intel"], s["judged"],
+                              transport=result.get("transport"))
+    return {"result": result, "guide": guide,
+            "trace": _compose_trace(result, req)}
 
 
 def _route_plan(s: S):

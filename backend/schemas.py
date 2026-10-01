@@ -38,6 +38,11 @@ class PPlan(BaseModel):
     hotel_factor: float = Field(default=1.0, description="住宿档位 0.8~1.5")
     food_factor: float = Field(default=1.0, description="餐饮档位 0.8~1.5")
     days: list[PDay]
+    guide: str = Field(default="", description=(
+        "该方案的详细攻略正文（markdown 精简语法：###小节、-列表、**重点**），"
+        "300-600字：行程怎么玩、门票怎么约、美食去哪吃、避雷提醒。"
+        "内容必须基于你刚才工具调研到的真实信息（笔记要点/真实票价/天气），"
+        "不要编造没核实过的店名和数字"))
 
 
 class DropItem(BaseModel):

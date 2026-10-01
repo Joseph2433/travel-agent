@@ -12,7 +12,10 @@ import agent_graph
 
 def _shape_recommend(s):
     out = {"trace": s.get("trace", []), "origin": s["origin"],
-           "destinations": s.get("ranked", []), "verdict": s.get("verdict")}
+           "destinations": s.get("ranked", []),
+           "more": s.get("more") or [],
+           "total_feasible": s.get("total_feasible"),
+           "verdict": s.get("verdict")}
     if s.get("message"):
         out["message"] = s["message"]
     return out
@@ -30,6 +33,7 @@ def _shape_plan(s, req):
             "dropped": judged["dropped"], "tips": judged["tips"],
         },
         "plans": r["plans"],
+        "guide": s.get("guide"),
     }
 
 

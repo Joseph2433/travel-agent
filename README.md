@@ -94,6 +94,13 @@ cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
   「小红书MCP助手」→ [aredink.com](https://mcp.aredink.com) 注册 → 创建连接拿
   API Token 填入插件 → `XHS_API_BASE=https://mcp.aredink.com/mcp` +
   `XHS_API_TOKEN=<token>`。它复用你浏览器里已登录的小红书会话，浏览器开着才在线。
+- **自建透传中继**（不依赖 aredink 云端，插件可直连部署在 Render 的后端）：
+  本服务内嵌中继端点——插件主动出站连 `wss://<本服务域名>/xhs/ws`（穿透 NAT，
+  浏览器无需公网可达），后端把 MCP `tools/call` 经该 WS 转发给插件执行。
+  配置三步：`XHS_RELAY_TOKEN=<自设强随机串>`；`XHS_API_BASE=https://<本服务域名>/xhs/mcp`
+  + `XHS_API_TOKEN=<同一串>`；插件设置页「服务器地址」填
+  `wss://<本服务域名>/xhs/ws`、API Key 填同一串。
+  `/api/status` 的 `xhs.relay_online` 可查看插件是否在线。
 
 不配置也完全可用：`get_city_intel` 已自动附带 `site:xiaohongshu.com` 的网页
 搜索结果，`travel_trends` 工具还会直接拉小红书热搜榜（免登录，uapis 聚合）。

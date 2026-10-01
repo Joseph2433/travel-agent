@@ -6,8 +6,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import envload                     # noqa: F401  必须先于 apis/llm 加载 .env
 import time
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import Body, FastAPI, Request, WebSocket
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -18,6 +18,7 @@ import auth
 import llm
 import monitor
 import tools
+import xhs_relay
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRONTEND = os.path.join(BASE, "frontend")
@@ -72,6 +73,29 @@ async def _monitor(request: Request, call_next):
         raise
     finally:
         monitor.log_access(request, status, (time.time() - t0) * 1000)
+
+
+# ---- 自建 x-mcp 中继：浏览器插件经 /xhs/ws 连进来，后端经 /xhs/mcp 透传调用 ----
+
+@app.websocket("/xhs/ws")
+async def xhs_ws(websocket: WebSocket):
+    await xhs_relay.handle_ws(websocket)
+
+
+@app.post("/xhs/mcp")
+def xhs_mcp(request: Request, body: dict = Body(default={})):
+    """MCP Streamable HTTP 端点（同步！call_tool 阻塞等插件回包，
+    async 会卡死事件循环）。XHS_API_BASE 指向本端点即完成透传。"""
+    if xhs_relay.RELAY_TOKEN:
+        tok = request.headers.get("x-api-key") or ""
+        auth_h = request.headers.get("authorization", "")
+        auth_h = auth_h[7:].strip() if auth_h.lower().startswith("bearer ") else ""
+        if xhs_relay.RELAY_TOKEN not in (tok, auth_h):
+            return JSONResponse({"error": "invalid relay token"}, status_code=401)
+    res = xhs_relay.mcp_dispatch(body)
+    if res is None:                                  # notifications/*
+        return Response(status_code=202)
+    return res
 
 
 # ---- 账号：登录/会话/管理员开号（无注册入口） ----
@@ -176,7 +200,8 @@ def status():
         "llm": llm.llm_available(),
         "llm_model": llm.model_name() if llm.llm_available() else None,
         "xhs": {"enabled": apis.xhs_enabled(),
-                "logged_in": (xhs or {}).get("logged_in")},
+                "logged_in": (xhs or {}).get("logged_in"),
+                "relay_online": xhs_relay.online()},
         "cities": len(tools.load_cities()),
         "modes": list(__import__("geo").TRANSPORT_MODES.items()),
     }

@@ -25,9 +25,11 @@ services:
         sync: false
       - key: BOCHA_API_KEY     # 可选，博查搜索
         sync: false
-      - key: XHS_API_BASE      # 可选，云端模式填 https://mcp.aredink.com/mcp
+      - key: XHS_API_BASE      # 可选，云端 https://mcp.aredink.com/mcp；或自建透传 https://<本服务>/xhs/mcp
         sync: false
-      - key: XHS_API_TOKEN     # 可选，x-mcp token
+      - key: XHS_API_TOKEN     # 可选，x-mcp token；自建透传时填同 XHS_RELAY_TOKEN
+        sync: false
+      - key: XHS_RELAY_TOKEN   # 可选，自建 x-mcp 透传中继的鉴权串（插件 serverUrl=wss://<本服务>/xhs/ws）
         sync: false
       - key: CORS_ORIGINS      # 填你的 Pages 域名，如 https://<user>.github.io
         sync: false

@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from agent import TravelAgent
 import agent
 import apis
+import auth
 import llm
 import tools
 
@@ -21,14 +22,111 @@ FRONTEND = os.path.join(BASE, "frontend")
 
 app = FastAPI(title="旅图 · TravelAgent")
 
+
+@app.middleware("http")
+async def _auth_gate(request: Request, call_next):
+    """启用账号体系后（auth.enabled()：存在用户）保护所有 /api/*，
+    仅放行登录接口；预检与非 API 路径（静态页）始终通过。"""
+    p = request.url.path
+    if (request.method == "OPTIONS" or not p.startswith("/api/")
+            or p == "/api/auth/login" or not auth.enabled()):
+        return await call_next(request)
+    tok = request.headers.get("authorization", "")
+    tok = tok[7:].strip() if tok.lower().startswith("bearer ") else ""
+    user = auth.resolve(tok)
+    if not user:
+        return JSONResponse({"error": "未登录或登录已过期"}, status_code=401)
+    request.state.user = user
+    return await call_next(request)
+
+
 # 拆分部署（前端 GitHub Pages + 后端独立主机）时允许跨域；
-# CORS_ORIGINS 逗号分隔，未配置则放开（无凭据请求，安全）
+# CORS_ORIGINS 逗号分隔，未配置则放开（无凭据请求，安全）。
+# 注意：CORS 必须最后注册（最外层），否则 401 响应缺 CORS 头、预检被拦
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in
                    os.getenv("CORS_ORIGINS", "*").split(",")],
     allow_methods=["*"], allow_headers=["*"])
+
+
+# ---- 账号：登录/会话/管理员开号（无注册入口） ----
+
+class LoginReq(BaseModel):
+    user: str
+    pw: str
+
+
+@app.post("/api/auth/login")
+def auth_login(req: LoginReq):
+    if not auth.enabled():
+        return {"auth": False}
+    tok = auth.login(req.user, req.pw)
+    if not tok:
+        return JSONResponse({"error": "用户名或密码错误"}, status_code=401)
+    u = auth.resolve(tok)
+    return {"auth": True, "token": tok,
+            "user": u["name"], "role": u["role"]}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    if not auth.enabled():
+        return {"auth": False}
+    u = getattr(request.state, "user", None)     # 中间件已拦无效 token
+    return {"auth": True, "user": u["name"], "role": u["role"]}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request):
+    tok = request.headers.get("authorization", "")
+    auth.logout(tok[7:].strip() if tok.lower().startswith("bearer ") else tok)
+    return {"ok": True}
+
+
+def _require_admin(request):
+    u = getattr(request.state, "user", None)
+    if not u or u["role"] != "admin":
+        return None
+    return u
+
+
+@app.get("/api/auth/users")
+def auth_users(request: Request):
+    if not _require_admin(request):
+        return JSONResponse({"error": "需要管理员权限"}, status_code=403)
+    return {"users": auth.list_users()}
+
+
+class NewUserReq(BaseModel):
+    user: str
+    pw: str
+    role: str = "user"
+
+
+@app.post("/api/auth/users")
+def auth_add_user(req: NewUserReq, request: Request):
+    if not _require_admin(request):
+        return JSONResponse({"error": "需要管理员权限"}, status_code=403)
+    name, e = auth.add_user(req.user, req.pw, req.role)
+    if e:
+        return JSONResponse({"error": e}, status_code=400)
+    return {"ok": True, "user": name}
+
+
+@app.delete("/api/auth/users/{name}")
+def auth_del_user(name: str, request: Request):
+    u = _require_admin(request)
+    if not u:
+        return JSONResponse({"error": "需要管理员权限"}, status_code=403)
+    if name == u["name"]:
+        return JSONResponse({"error": "不能删除当前登录的管理员"},
+                            status_code=400)
+    e = auth.remove_user(name)
+    if e:
+        return JSONResponse({"error": e}, status_code=400)
+    return {"ok": True}
 
 
 class RecommendReq(BaseModel):

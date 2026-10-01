@@ -25,6 +25,11 @@
       <span class="dot" id="dotAmap"></span><span id="lblAmap">高德</span>
       <span class="dot ok" id="dotRail"></span><span>12306</span>
       <span class="dot ok"></span><span>本地知识库</span>
+      <span class="user-chip hidden" id="userChip">
+        <b id="userName"></b>
+        <button type="button" class="chip-mini hidden" id="btnUsers">账号</button>
+        <button type="button" class="chip-mini" id="btnLogout">退出</button>
+      </span>
     </div>
   </div>
 </nav>
@@ -158,6 +163,47 @@
 </footer>
 
 <div class="toast" id="toast"></div>
+
+<!-- ═══════════ 登录门：启用账号体系后拦截所有 API（401 → 显示） ═══════════ -->
+<div class="auth-gate hidden" id="authGate">
+  <div class="auth-card">
+    <div class="brand auth-brand">
+      <svg viewBox="0 0 24 24" class="brand-mark" fill="none" stroke="currentColor" stroke-width="1.8">
+        <path d="M12 21s-7-5.6-7-11a7 7 0 0 1 14 0c0 5.4-7 11-7 11z"/><circle cx="12" cy="10" r="2.6"/>
+      </svg>
+      <span class="brand-name">旅图</span><span class="brand-sub">TravelAgent</span>
+    </div>
+    <p class="auth-sub">内部站点 · 账号由管理员开通，不开放注册</p>
+    <input id="authUser" placeholder="用户名" autocomplete="username">
+    <input id="authPass" type="password" placeholder="密码" autocomplete="current-password">
+    <div class="auth-err" id="authErr"></div>
+    <button class="btn primary auth-btn" id="btnLogin">进 入</button>
+  </div>
+</div>
+
+<!-- ═══════════ 账号管理弹层（仅管理员可见入口） ═══════════ -->
+<div class="modal hidden" id="adminModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3>账号管理</h3>
+      <button type="button" class="chip-mini" id="btnAdminClose">✕</button></div>
+    <div class="auth-err" id="adminErr"></div>
+    <table class="u-table">
+      <thead><tr><th>账号</th><th>角色</th><th></th></tr></thead>
+      <tbody id="userRows"></tbody>
+    </table>
+    <div class="u-add">
+      <input id="nuName" placeholder="新用户名">
+      <input id="nuPass" type="password" placeholder="密码">
+      <select id="nuRole">
+        <option value="user">普通</option>
+        <option value="admin">管理员</option>
+      </select>
+      <button type="button" class="btn primary" id="btnAddUser">添加</button>
+    </div>
+    <p class="u-note">云端部署：此处添加的账号在 Render 重启/重部署后会丢失，
+      长期账号请写入环境变量 AUTH_SEED</p>
+  </div>
+</div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="config.js"></script>

@@ -16,6 +16,99 @@ const API_BASE = (() => {
   return (saved || (isLocal ? "" : window.API_BASE || "")).replace(/\/+$/, "");
 })();
 
+/* ── 账号鉴权：token 存 localStorage；401 → 弹登录门 ── */
+let TOKEN = localStorage.getItem("ta_token") || "";
+let ME = null;
+
+async function apiFetch(path, opts = {}){
+  opts.headers = Object.assign({}, opts.headers,
+                               TOKEN ? {Authorization: "Bearer " + TOKEN} : {});
+  const r = await fetch(API_BASE + path, opts);
+  if (r.status === 401){ showAuth(); throw new Error("unauthorized"); }
+  return r;
+}
+
+function showAuth(){
+  $("#authGate").classList.remove("hidden");
+  setTimeout(() => $("#authUser").focus(), 60);
+}
+function hideAuth(){ $("#authGate").classList.add("hidden"); }
+
+function applyMe(){
+  if (!ME || !ME.auth) return;
+  $("#userChip").classList.remove("hidden");
+  $("#userName").textContent = "@" + ME.user;
+  $("#btnUsers").classList.toggle("hidden", ME.role !== "admin");
+}
+
+async function doLogin(){
+  const user = $("#authUser").value.trim(), pw = $("#authPass").value;
+  $("#authErr").textContent = "";
+  try{
+    const r = await fetch(API_BASE + "/api/auth/login", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({user, pw})});
+    const d = await r.json();
+    if (!r.ok || d.auth === false){
+      $("#authErr").textContent = d.error || "登录失败"; return;
+    }
+    TOKEN = d.token; localStorage.setItem("ta_token", TOKEN);
+    location.reload();                       // 重新走 init（含 hash 归位）
+  }catch(e){ $("#authErr").textContent = "网络错误：" + e.message; }
+}
+
+async function doLogout(){
+  try{ await apiFetch("/api/auth/logout", {method: "POST"}); }catch(e){}
+  localStorage.removeItem("ta_token"); TOKEN = ""; location.reload();
+}
+
+async function openAdmin(){
+  $("#adminModal").classList.remove("hidden");
+  $("#adminErr").textContent = "";
+  try{
+    const d = await apiFetch("/api/auth/users").then(r => r.json());
+    $("#userRows").innerHTML = (d.users || []).map(u =>
+      `<tr><td>${esc(u.name)}</td>
+           <td>${u.role === "admin" ? "管理员" : "普通"}</td>
+           <td>${u.name === ME.user ? `<span class="u-self">当前</span>`
+              : `<button type="button" class="chip-mini" data-del="${esc(u.name)}">删除</button>`}</td>
+      </tr>`).join("");
+    $$("#userRows [data-del]").forEach(b => b.onclick = async () => {
+      const r = await apiFetch("/api/auth/users/" +
+        encodeURIComponent(b.dataset.del), {method: "DELETE"});
+      const d2 = await r.json().catch(() => ({}));
+      if (!r.ok){ $("#adminErr").textContent = d2.error || "删除失败"; return; }
+      openAdmin();
+    });
+  }catch(e){}
+}
+
+async function addUser(){
+  const user = $("#nuName").value.trim(), pw = $("#nuPass").value,
+        role = $("#nuRole").value;
+  $("#adminErr").textContent = "";
+  const r = await apiFetch("/api/auth/users", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({user, pw, role})});
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok){ $("#adminErr").textContent = d.error || "添加失败"; return; }
+  $("#nuName").value = ""; $("#nuPass").value = "";
+  openAdmin();
+}
+
+function bindAuth(){
+  $("#btnLogin").onclick = doLogin;
+  for (const id of ["#authUser", "#authPass"])
+    $(id).addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+  $("#btnLogout").onclick = doLogout;
+  $("#btnUsers").onclick = openAdmin;
+  $("#btnAdminClose").onclick = () => $("#adminModal").classList.add("hidden");
+  $("#adminModal").addEventListener("click", e => {
+    if (e.target.id === "adminModal") $("#adminModal").classList.add("hidden");
+  });
+  $("#btnAddUser").onclick = addUser;
+}
+
 const state = { origin: null, dests: [], plans: [], intel: null, map: null,
                 provinces: [], view: "home", planIdx: null, guide: null,
                 lastPlanResp: null };
@@ -61,10 +154,16 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g,
 /* ── 初始化 ── */
 async function init(){
   bindForm();
+  bindAuth();
   showView("home", false);
   if (location.hash) history.replaceState(null, "", location.pathname);
+  try{                                   // 账号门：启用后无有效 token → 登录页
+    const me = await apiFetch("/api/auth/me").then(r => r.json());
+    if (me.auth){ ME = me; applyMe(); }
+    hideAuth();
+  }catch(e){ return; }                   // 401 → 登录门已显示，中止初始化
   try{
-    const st = await fetch(API_BASE + "/api/status").then(r => r.json());
+    const st = await apiFetch("/api/status").then(r => r.json());
     const dot = $("#dotAmap"), lbl = $("#lblAmap");
     if (st.amap){ dot.classList.add("ok"); lbl.textContent = "高德API"; }
     else { dot.classList.add("warn"); lbl.textContent = "高德(未配Key)"; }
@@ -73,7 +172,7 @@ async function init(){
     else { ld.classList.add("warn"); ll.textContent = "规则模式"; }
   }catch(e){}
   try{
-    const {provinces} = await fetch(API_BASE + "/api/geo/provinces").then(r => r.json());
+    const {provinces} = await apiFetch("/api/geo/provinces").then(r => r.json());
     const ps = $("#selProv");
     ps.innerHTML = provinces.map(p => `<option>${p}</option>`).join("");
     ps.value = "北京";
@@ -88,7 +187,7 @@ async function loadCities(prov){
   const sel = $("#selCity");
   sel.innerHTML = `<option>加载中…</option>`;
   try{
-    const {cities} = await fetch(API_BASE + "/api/geo/cities?province=" + encodeURIComponent(prov))
+    const {cities} = await apiFetch("/api/geo/cities?province=" + encodeURIComponent(prov))
       .then(r => r.json());
     sel.innerHTML = cities.map(c =>
       `<option value="${c.name}" data-lat="${c.lat ?? ""}" data-lng="${c.lng ?? ""}">${c.name}</option>`
@@ -108,7 +207,7 @@ async function loadScope(){
   if (!opt || !opt.value) return;
   const body = collectParams();
   try{
-    const r = await fetch(API_BASE + "/api/agent/scope", {
+    const r = await apiFetch("/api/agent/scope", {
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify(body)
     }).then(r => r.json());
@@ -135,7 +234,7 @@ function locateByGPS(silent){
   note.textContent = "定位中…";
   navigator.geolocation.getCurrentPosition(async pos => {
     try{
-      const r = await fetch(API_BASE + "/api/locate", {
+      const r = await apiFetch("/api/locate", {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({lat: pos.coords.latitude, lng: pos.coords.longitude})
       }).then(r => r.json());
@@ -236,7 +335,7 @@ function endTrace(){ $("#traceSpinner").classList.add("done"); }
 
 /* POST + SSE 流读取：每个 step 事件立刻上屏，done 返回完整结果 */
 async function streamPost(url, body, onStep){
-  const resp = await fetch(API_BASE + url, {
+  const resp = await apiFetch(url, {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify(body)
   });

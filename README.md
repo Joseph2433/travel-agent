@@ -79,6 +79,7 @@ cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
 | `XHS_API_BASE` | 小红书笔记源地址，二选一：本地 [xiaohongshu-mcp](https://github.com/xpzouying/xiaohongshu-mcp) `http://localhost:18060`（REST 层）；或 x-mcp 插件云端 `https://mcp.aredink.com/mcp`（以 `/mcp` 结尾自动走 MCP Streamable HTTP 协议）。启用 `search_xhs_notes` 工具让模型查真实攻略笔记 | 跳过小红书源 |
 | `XHS_API_TOKEN` | 本地服务设了 `AUTH_TOKEN` 时填；x-mcp 插件版填 aredink 账号的 API Token（同时以 `X-API-Key` 与 `Authorization: Bearer` 发送） | — |
 | `BOCHA_API_KEY` | [博查AI搜索](https://open.bochaai.com/) key：攻略摘要主源（中文质量好、索引含小红书），有免费额度 | 回退 Bing/DDG 抓取 |
+| `AUTH_SEED` | 账号种子：JSON `[{"user":"x","pass":"y","role":"admin"}]` 或 `admin:密码,bob:密码`。配置后启用登录鉴权（无注册入口，仅管理员开号） | 空 = 免登录（本地开发） |
 
 小红书没有面向普通开发者的官方笔记搜索 API，目前可用两条社区方案（均为第三方
 逆向/聚合，仅适合个人学习用途，账号有风控风险，建议用小号）：
@@ -112,6 +113,23 @@ cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
 | POST | /api/agent/plans | 阶段二：搜索+判断+生成 3-5 套方案（可指定任意目的地） |
 | POST | /api/agent/destinations/stream | 同上，SSE 流式：逐步推 trace 事件 |
 | POST | /api/agent/plans/stream | 同上，SSE 流式 |
+
+### 账号鉴权（可选启用）
+
+`AUTH_SEED` 配置种子账号后启用：**无注册入口**，仅管理员可开号。本地也可
+`python backend/auth.py add <用户名> <密码> [admin|user]` 管理。
+账号库在 `backend/data/auth.json`（PBKDF2 加盐哈希，已 gitignore）。
+登录后前端持有 token（30 天），所有 `/api/*` 请求需 `Authorization: Bearer`。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | /api/auth/login | 登录 → token（唯一公开接口） |
+| GET | /api/auth/me | 当前登录态/鉴权是否启用 |
+| POST | /api/auth/logout | 注销 |
+| GET/POST/DELETE | /api/auth/users | 管理员：列账号/开号/删号 |
+
+注意云端文件系统是临时的：Render 上管理面板添加的账号在重部署后丢失，
+长期账号写进 `AUTH_SEED`（可放多个，追加即可）。
 
 ## 前端
 

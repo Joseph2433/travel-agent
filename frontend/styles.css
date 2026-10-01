@@ -337,3 +337,46 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
   .plan-right{text-align:left}
   .hero{padding:110px 0 60px}
 }
+
+/* ── 账号鉴权：登录门 / 用户 chip / 管理弹层 ── */
+.auth-gate{position:fixed;inset:0;z-index:100;display:flex;align-items:center;
+  justify-content:center;background:linear-gradient(160deg,#f4efe6,#eef4f4);
+  backdrop-filter:blur(6px)}
+.auth-card{width:330px;background:var(--card);border:1.5px solid var(--line);
+  border-radius:20px;padding:36px 34px;box-shadow:var(--shadow)}
+.auth-brand{justify-content:center;margin-bottom:14px}
+.auth-sub{text-align:center;font-size:12px;color:var(--ink3);margin-bottom:22px;
+  letter-spacing:1px}
+.auth-card input{width:100%;padding:11px 14px;margin-bottom:12px;
+  border:1.5px solid var(--line);border-radius:10px;font-size:14px;
+  font-family:inherit;background:#fff;color:var(--ink)}
+.auth-card input:focus{outline:none;border-color:var(--teal)}
+.auth-err{min-height:18px;font-size:12px;color:var(--coral);margin-bottom:8px;
+  text-align:center}
+.auth-btn{width:100%;justify-content:center}
+
+.user-chip{display:inline-flex;align-items:center;gap:6px;margin-left:10px;
+  padding-left:10px;border-left:1px solid var(--line)}
+.user-chip b{font-size:12.5px;color:var(--ink2);font-weight:600}
+.chip-mini{padding:3px 10px;border-radius:999px;border:1px solid var(--line);
+  font-size:11px;color:var(--ink3);background:#fff;cursor:pointer;transition:.2s}
+.chip-mini:hover{border-color:var(--teal);color:var(--teal)}
+
+.modal{position:fixed;inset:0;z-index:110;background:rgba(21,34,51,.4);
+  display:flex;align-items:center;justify-content:center}
+.modal-card{width:420px;max-width:92vw;background:var(--card);border-radius:16px;
+  padding:24px 26px;box-shadow:var(--shadow)}
+.modal-head{display:flex;justify-content:space-between;align-items:center;
+  margin-bottom:10px}
+.modal-head h3{font-family:var(--serif);font-size:19px}
+.u-table{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:16px}
+.u-table th{font-size:11px;color:var(--ink3);text-align:left;padding:6px 4px;
+  border-bottom:1px solid var(--line)}
+.u-table td{padding:8px 4px;border-bottom:1px dashed var(--line);color:var(--ink2)}
+.u-self{font-size:11px;color:var(--ink3)}
+.u-add{display:flex;gap:8px}
+.u-add input{flex:1;min-width:0;padding:8px 10px;border:1.5px solid var(--line);
+  border-radius:8px;font-size:13px;font-family:inherit}
+.u-add select{min-width:0;padding:8px 6px;font-size:13px}
+.u-add .btn{padding:8px 16px;font-size:13px}
+.u-note{margin-top:14px;font-size:11px;color:var(--ink3);line-height:1.7}

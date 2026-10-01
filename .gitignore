@@ -6,6 +6,7 @@ tmp/
 .DS_Store
 tmp/
 tmp_server.log
+backend/data/auth.json     # 账号库（密码哈希+会话token），不进仓库
 
 # 第三方二进制（xiaohongshu-mcp 等，自行下载）
 third_party/

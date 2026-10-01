@@ -1,6 +1,8 @@
 """Agent 工具集：定位解析、目的地扫描排序、情报搜索、情报判断、行程编排。"""
 import json
 import os
+import threading
+import time
 from datetime import datetime
 
 import apis
@@ -108,10 +110,45 @@ def scan_destinations(ctx, origin, budget, days, transport, prefs,
     return out
 
 
+_trend_cache = {"ts": 0.0, "names": set()}
+# 高频词误伤名单：这些地级市名同时是常用词，命中热榜不算"热议"
+_TREND_DENY = {"长治", "朝阳", "灯塔", "前进", "向阳", "东风", "共和",
+               "文昌", "同心", "平安", "太和", "清流", "大田", "双峰",
+               "永新", "惠民", "富民", "和平", "新华", "新兴", "解放"}
+
+
+def trending_cities(ttl=600):
+    """热榜标题中出现的城市名集合：微博/抖音/小红书三榜并发抓取，
+    10 分钟缓存，失败降级为空集。供排序加"近期热议"分。"""
+    if time.time() - _trend_cache["ts"] < ttl:
+        return _trend_cache["names"]
+    titles, lock = [], threading.Lock()
+
+    def one(b):
+        rows = apis.hot_board(b, 20) or []
+        with lock:
+            titles.extend(x["title"] or "" for x in rows)
+
+    ths = [threading.Thread(target=one, args=(b,), daemon=True)
+           for b in ("weibo", "douyin", "xiaohongshu")]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(8)
+    pools = ([c["name"] for c in load_cities()]
+             + [r["name"] for r in (apis.all_prefecture_cities() or [])])
+    names = {n for n in pools
+             if len(n) >= 2 and n not in _TREND_DENY
+             and any(n in t for t in titles)}
+    _trend_cache.update({"ts": time.time(), "names": names})
+    return names
+
+
 def rank_destinations(ctx, scanned, budget, days, prefs):
-    """多因子打分：预算契合 + 天数匹配 + 季节适宜 + 偏好命中 + 距离效率。"""
+    """多因子打分：预算契合 + 天数匹配 + 季节适宜 + 偏好命中 + 距离效率 + 热榜。"""
     month = datetime.now().month
     cities = {c["name"]: c for c in load_cities()}
+    trending = trending_cities()
     scored = []
     for s in scanned:
         if not s["feasible"]:
@@ -150,6 +187,9 @@ def rank_destinations(ctx, scanned, budget, days, prefs):
         # 距离效率（10）：交通耗时越短越好
         h = s["transport_est"].get("hours", 99)
         score += max(0, 10 - h)
+        # 热榜（10）：目的地正挂在微博/抖音/小红书热搜上
+        if s["city"] in trending:
+            score += 10; reasons.append("近期全网热议")
         scored.append({
             "city": c["name"], "province": c["province"], "score": round(score),
             "km": s["km"], "lat": c["lat"], "lng": c["lng"],
@@ -168,7 +208,8 @@ def fetch_intel(ctx, city_name):
     """目的地情报搜索：高德POI + 天气 + 网页攻略 + 本地知识库，多源融合。"""
     c = next(x for x in load_cities() if x["name"] == city_name)
     intel = {"city": c, "sources": ["本地知识库"], "pois_scenic": None,
-             "pois_food": None, "weather": None, "web": None}
+             "pois_food": None, "weather": None, "web": None,
+             "scenic_qunar": None}
     w = apis.weather_live(c["name"])
     if w:
         intel["weather"] = w; intel["sources"].append("高德天气")
@@ -178,6 +219,9 @@ def fetch_intel(ctx, city_name):
     food = apis.poi_search(c["name"], "特色美食", "050000", 8)
     if food and food["pois"]:
         intel["pois_food"] = food["pois"]
+    qs = apis.qunar_scenic(c["name"], 8)
+    if qs and qs["scenic"]:
+        intel["scenic_qunar"] = qs["scenic"]; intel["sources"].append("去哪儿票价")
     web = apis.web_search_snippets(f"{c['name']}旅游攻略 必去景点 美食")
     if web:
         intel["web"] = web; intel["sources"].append("网页搜索")
@@ -205,7 +249,8 @@ def judge_intel(ctx, intel, days, prefs):
         dropped.append({"name": a["n"], "reason": "天数内排不下，忍痛割爱"})
     notes += _base_notes(intel)
     return {"kept": kept, "dropped": dropped, "notes": notes,
-            "foods": c["foods"][:5], "tips": c["tips"]}
+            "foods": c["foods"][:5], "tips": c["tips"],
+            "qunar_scenic": intel.get("scenic_qunar") or []}
 
 
 def _base_notes(intel):
@@ -219,6 +264,11 @@ def _base_notes(intel):
     if intel.get("pois_scenic"):
         real = [p["name"] for p in intel["pois_scenic"][:4]]
         notes.append("高德实时热门景点参考：" + "、".join(real))
+    if intel.get("scenic_qunar"):
+        top = sorted(intel["scenic_qunar"],
+                     key=lambda s: -(s.get("sales") or 0))[:3]
+        notes.append("去哪儿在售景点（真实票价）：" + "、".join(
+            f"{s['name']}¥{s['ticket']:g}" for s in top))
     if month in c["bestMonths"]:
         notes.append(f"{month}月正值{c['name']}佳季")
     else:
@@ -259,7 +309,8 @@ def apply_llm_judge(intel, days, prefs, llm_out):
              if isinstance(x, str) and x.strip()][:4]
     notes += _base_notes(intel)
     return {"kept": kept, "dropped": dropped, "notes": notes,
-            "foods": c["foods"][:5], "tips": c["tips"]}
+            "foods": c["foods"][:5], "tips": c["tips"],
+            "qunar_scenic": intel.get("scenic_qunar") or []}
 
 
 def _real_rail(origin_name, dest_name):
@@ -321,7 +372,8 @@ def compose_plans(ctx, origin, dest_name, budget, days, transport, prefs, judged
     plans = []
     for t in themes[:5]:
         plan = _build_plan(t, c, origin, kept, foods, days,
-                           transport_info, budget, prefs)
+                           transport_info, budget, prefs,
+                           qunar=judged.get("qunar_scenic"))
         plans.append(plan)
     return {"plans": plans, "transport": transport_info, "km": km,
             "resolved_mode": resolved_mode}
@@ -349,8 +401,35 @@ def _plan_themes(days, c):
     return themes
 
 
+_CORE_FILLER = ("风景名胜", "国家", "旅游", "度假", "风景", "名胜",
+                "景区", "公园", "区")
+
+
+def _core_name(x):
+    """景点名归一化："秦始皇帝陵博物院(兵马俑)"→"秦始皇帝陵博物院"，
+    "西溪国家湿地公园"→"西溪湿地"。便于和知识库短名做包含匹配。"""
+    n = (x or "").split("（")[0].split("(")[0].strip()
+    for w in _CORE_FILLER:
+        if n != w:                       # 防止"西湖区"被剥成"西湖"之外的空串
+            n = n.replace(w, "")
+    return n.strip() or (x or "").split("（")[0].split("(")[0].strip()
+
+
+def _qunar_price(name, scenic):
+    """知识库景点名 → 去哪儿在售景点的真实票价；匹配不到返回 None。"""
+    n = _core_name(name)
+    best = None
+    for s in scenic or []:
+        q, core = s["name"], _core_name(s["name"])
+        hit = (n and n in q) or (len(core) >= 3 and core in n) or n == core
+        if hit and (best is None
+                    or (s.get("sales") or 0) > (best.get("sales") or 0)):
+            best = s
+    return best["ticket"] if best else None
+
+
 def _build_plan(theme, city, origin, attractions, foods, days,
-                transport, budget, prefs):
+                transport, budget, prefs, qunar=None):
     """把景点/美食排进 days 天的日程槽位。"""
     density = theme["density"]
     atts = list(attractions)
@@ -399,8 +478,10 @@ def _build_plan(theme, city, origin, attractions, foods, days,
         base = 1 if d == 1 else 0          # 抵达日景点从下午排起
         for i, a in enumerate(picked):
             slot = "全天" if a["hours"] >= 7 else slot_order[min(i + base, 2)]
+            real = _qunar_price(a["n"], qunar)
             items.append({"slot": slot, "type": "景点", "name": a["n"],
-                          "note": a["desc"], "cost": a["ticket"],
+                          "note": a["desc"],
+                          "cost": real if real is not None else a["ticket"],
                           "hours": a["hours"]})
         # 餐饮槽位：午/晚
         f1 = foods[(d - 1) % len(foods)] if foods else None
@@ -422,7 +503,8 @@ def _build_plan(theme, city, origin, attractions, foods, days,
         itinerary.append({"day": d, "title": _day_title(d, days, picked),
                           "items": items})
 
-    tickets = sum(a["ticket"] for a in used)
+    tickets = sum((rp if (rp := _qunar_price(a["n"], qunar)) is not None
+                   else a["ticket"]) for a in used)
     b = geo.trip_budget(city, days, transport["cost"],
                         hotel_factor=theme["hf"], food_factor=theme["ff"],
                         attraction_ticket_sum=tickets)

@@ -588,6 +588,12 @@ def _poi_map(tool_data):
             for p in (td.get("pois_scenic") or []) + (td.get("pois_food") or []):
                 if isinstance(p, dict) and p.get("name"):
                     m[p["name"]] = p
+            for s in td.get("scenic_qunar") or []:
+                if isinstance(s, dict) and s.get("name"):
+                    m.setdefault(s["name"], {"name": s["name"],
+                                             "cost": s.get("ticket"),
+                                             "rating": s.get("score"),
+                                             "addr": "", "_src": "去哪儿"})
     for td in (tool_data.get("search_pois") or []):
         if isinstance(td, dict):
             for p in td.get("pois") or []:
@@ -620,7 +626,8 @@ def _map_item(it, att_map, food_map, poi_map=None):
         if p:
             cost = _poi_cost(p, 45)
             return {"slot": it.slot, "type": "景点", "name": p["name"][:16],
-                    "note": f"高德POI · 评分{p.get('rating') or '—'} · "
+                    "note": f"{p.get('_src') or '高德POI'} · "
+                            f"评分{p.get('rating') or '—'} · "
                             f"{(p.get('addr') or '')[:24]}",
                     "cost": cost, "hours": 3, "_ticket": cost}
         return None
@@ -653,6 +660,8 @@ def _intel_from_tools(c, tool_data):
         if td.get("pois_scenic"):
             intel["pois_scenic"] = td["pois_scenic"]
             intel["sources"].append("高德POI")
+        if td.get("scenic_qunar"):
+            intel["sources"].append("去哪儿票价")
         if td.get("web"):
             intel["web"] = list(td["web"]); intel["sources"].append("网页搜索")
     xhs_td = _last_td(tool_data, "search_xhs_notes")

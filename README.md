@@ -23,14 +23,18 @@ TravelAgent  backend/agent.py        # 门面：一次请求 = 一次 LangGraph 
    ├─► llm.py         ── OpenAI兼容协议(Kimi/DeepSeek/OpenAI)  需 LLM_API_KEY
    ├─► agent_tools.py ── 暴露给模型的 @tool：scan_destinations / get_city_profile
    │                     / get_city_intel / search_pois(任意类别POI实时搜索)
+   │                     / travel_trends(各平台实时热搜榜，免登录)
    │                     / search_xhs_notes(小红书攻略笔记，可选源)
    │                     / query_trains(往返) / estimate_transport
    │                     / calc_budget / submit_result(终止+结构化提交)
    ├─► schemas.py     ── pydantic 输出契约（模型只给名字/排序/理由）
    ├─► tools.py       ── 规则引擎实现（无key兜底）+ LLM结论合并校验
+   │                     + 热榜命中加分（微博/抖音/小红书）+ 真实票价映射
    ├─► apis.py        ── 高德 Web服务(IP/地理编码/行政区/POI/天气/驾车)  需 AMAP_KEY
    │                  ── 12306 queryG/queryTicketPrice  真实往返车次+余票+票价
-   │                  ── Bing/DuckDuckGo  攻略网页摘要（含 site:xiaohongshu.com 定向）
+   │                  ── 去哪儿门票频道  在售景点真实票价/5A级标/销量热度（免key）
+   │                  ── uapis.cn 聚合热榜  微博/知乎/抖音/小红书/头条（免key免注册）
+   │                  ── 博查AI搜索(需BOCHA_API_KEY)→Bing/DuckDuckGo  攻略网页摘要
    │                  ── 小红书笔记搜索  需本地 xiaohongshu-mcp（可选，XHS_API_BASE）
    ├─► geo.py         ── 距离/交通/预算估算模型（无网兜底）
    ├─► data/cities.json             # 25 城种子知识库：画像/消费档兜底，
@@ -70,14 +74,24 @@ cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
 | `LLM_API_KEY` | 大模型 key（OpenAI 兼容协议，需支持 function calling） | 规则引擎决策 |
 | `LLM_BASE_URL` | 默认 `https://api.moonshot.cn/v1` | — |
 | `LLM_MODEL` | 默认 `kimi-k2-0905-preview` | — |
-| `XHS_API_BASE` | 本地 [xiaohongshu-mcp](https://github.com/xpzouying/xiaohongshu-mcp) 地址，如 `http://localhost:18060`；启用 `search_xhs_notes` 工具让模型查真实攻略笔记 | 跳过小红书源 |
-| `XHS_API_TOKEN` | 该服务设了 `AUTH_TOKEN` 时填 | — |
+| `XHS_API_BASE` | 小红书笔记源地址，二选一：本地 [xiaohongshu-mcp](https://github.com/xpzouying/xiaohongshu-mcp) `http://localhost:18060`（REST 层）；或 x-mcp 插件云端 `https://mcp.aredink.com/mcp`（以 `/mcp` 结尾自动走 MCP Streamable HTTP 协议）。启用 `search_xhs_notes` 工具让模型查真实攻略笔记 | 跳过小红书源 |
+| `XHS_API_TOKEN` | 本地服务设了 `AUTH_TOKEN` 时填；x-mcp 插件版填 aredink 账号的 API Token（同时以 `X-API-Key` 与 `Authorization: Bearer` 发送） | — |
+| `BOCHA_API_KEY` | [博查AI搜索](https://open.bochaai.com/) key：攻略摘要主源（中文质量好、索引含小红书），有免费额度 | 回退 Bing/DDG 抓取 |
 
-小红书没有面向普通开发者的官方笔记搜索 API，以上是社区开源方案：下载其
-release 二进制 → 跑 `xiaohongshu-login` 扫码登录自己的小红书账号 → 启动
-`xiaohongshu-mcp`（无头浏览器，默认 :18060），REST 层即被本应用接入。
-注意属第三方逆向方案，账号有风控风险，建议用小号。不配置也完全可用：
-`get_city_intel` 已自动附带 `site:xiaohongshu.com` 的网页搜索结果。
+小红书没有面向普通开发者的官方笔记搜索 API，目前可用两条社区方案（均为第三方
+逆向/聚合，仅适合个人学习用途，账号有风控风险，建议用小号）：
+
+- **本地 xiaohongshu-mcp**：下载 release 二进制 → `xiaohongshu-login` 扫码登录
+  自己的小红书账号 → 启动 `xiaohongshu-mcp`（无头浏览器，默认 :18060），
+  `XHS_API_BASE=http://localhost:18060`。注意其内置无头浏览器的 `leakless.exe`
+  易被 Windows Defender/火绒误报，需把安装目录与 `%TEMP%\leakless-*` 加信任区。
+- **x-mcp 浏览器插件版**（推荐，零部署、不碰杀软）：Chrome 商店装
+  「小红书MCP助手」→ [aredink.com](https://mcp.aredink.com) 注册 → 创建连接拿
+  API Token 填入插件 → `XHS_API_BASE=https://mcp.aredink.com/mcp` +
+  `XHS_API_TOKEN=<token>`。它复用你浏览器里已登录的小红书会话，浏览器开着才在线。
+
+不配置也完全可用：`get_city_intel` 已自动附带 `site:xiaohongshu.com` 的网页
+搜索结果，`travel_trends` 工具还会直接拉小红书热搜榜（免登录，uapis 聚合）。
 
 也可以直接 export/set 环境变量（优先级高于 .env）。
 注意：配置在**进程启动时**读取，改完要重启 `python run.py`。

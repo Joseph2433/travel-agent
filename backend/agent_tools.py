@@ -77,13 +77,20 @@ def _poi_rows(ps):
 @tool
 def get_city_intel(city: str):
     """获取某城市实时情报：天气实况、高德热门景点POI(评分/参考价/地址)、
-    热门美食POI、网络攻略摘要（含小红书被索引的笔记）。POI 名称可作为行程的
-    景点/美食候选。"""
+    去哪儿在售景点榜(真实挂牌票价/5A级标/评分/销量热度)、热门美食POI、
+    网络攻略摘要（含小红书被索引的笔记）。POI/景点名称可作为行程候选，
+    去哪儿 ticket 字段是真实票价，编排预算时优先用它而不是估算。"""
     name = city.rstrip("市")
     out = {"city": name, "weather": apis.weather_live(name)}
     ps = _poi_rows(apis.poi_search(name, "景点", "110000", 8))
     if ps:
         out["pois_scenic"] = ps
+    qs = apis.qunar_scenic(name, 10)
+    if qs:
+        out["scenic_qunar"] = [{"name": s["name"], "star": s["star"],
+                                "score": s["score"], "ticket": s["ticket"],
+                                "intro": s["intro"], "sales": s["sales"]}
+                               for s in qs["scenic"]]
     pf = _poi_rows(apis.poi_search(name, "特色美食", "050000", 8))
     if pf:
         out["pois_food"] = pf
@@ -144,6 +151,23 @@ def search_xhs_notes(city: str, topic: str = "旅游攻略",
 
 
 @tool
+def travel_trends(boards: list = None, count: int = 10):
+    """拉取各平台实时热搜榜（微博/知乎/抖音/小红书/头条），免登录免费。
+    用于发现正在爆的目的地/网红玩法/文旅热点（如"XX麻辣烫""XX草原"），
+    让推荐与行程紧跟潮流。返回 {board: [{rank,title,hot,url}]}。"""
+    out = {}
+    for b in (boards or list(apis.HOT_BOARDS)):
+        rows = apis.hot_board(b, count)
+        if rows:
+            out[b] = rows
+    if not out:
+        return _j({"error": "热榜接口暂不可用"})
+    return _j({"boards": out,
+               "tip": "筛出与目的地/玩法/节庆相关的条目；命中候选城市时"
+                      "可在推荐理由中标注'近期热议'"})
+
+
+@tool
 def query_trains(from_city: str, to_city: str):
     """查询12306往返真实车次（预售期第7天）。返回去程 outbound 与回程 return
     两个方向各自的车次列表：车次/出发站到达站/发时到时/历时h/余票/二等座一等座票价。"""
@@ -183,7 +207,8 @@ def calc_budget(city: str, days: int, transport_one_way: float,
                 hotel_factor: float = 1.0, food_factor: float = 1.0,
                 tickets: float = 0):
     """计算行程预算拆解（单人）：往返交通×2 + 住宿(晚数=天数-1) + 餐饮 + 门票 + 市内。
-    hotel_factor/food_factor 调节档位（0.8穷游 1.0标准 1.3+舒适），tickets 为门票合计。"""
+    hotel_factor/food_factor 调节档位（0.8穷游 1.0标准 1.3+舒适），tickets 为门票合计
+    ——优先把 get_city_intel 返回的 scenic_qunar 真实票价相加传入，不要估算。"""
     c = _city(city)
     if not c:
         return _j({"error": f"未知城市「{city}」"})
@@ -199,6 +224,8 @@ def submit_result(payload: dict):
     return "已收到，任务结束"
 
 
-REC_TOOLS = [scan_destinations, get_city_profile, get_city_intel, submit_result]
+REC_TOOLS = [scan_destinations, get_city_profile, get_city_intel,
+             travel_trends, submit_result]
 PLAN_TOOLS = [get_city_profile, get_city_intel, search_pois, search_xhs_notes,
-              query_trains, estimate_transport, calc_budget, submit_result]
+              travel_trends, query_trains, estimate_transport, calc_budget,
+              submit_result]

@@ -387,8 +387,37 @@ def _clean_html(s):
     return _html.unescape(re.sub(r"<[^>]+>", "", s or "")).strip()
 
 
+BOCHA_KEY = os.environ.get("BOCHA_API_KEY", "").strip()
+
+
+def _bocha_search(query: str, count: int):
+    """博查 AI 搜索（open.bochaai.com，需 BOCHA_API_KEY，有免费额度）。
+    面向 Agent 的干净结果，国内直连，且索引覆盖小红书等内容站。"""
+    if not BOCHA_KEY:
+        return None
+    try:
+        r = requests.post("https://api.bochaai.com/v1/web-search",
+                          json={"query": query, "count": count,
+                                "summary": True, "freshness": "noLimit"},
+                          headers={"Authorization": f"Bearer {BOCHA_KEY}",
+                                   "Content-Type": "application/json"},
+                          timeout=_TIMEOUT)
+        pages = (((r.json() or {}).get("data") or {}).get("webPages") or {})
+        out = [{"title": _clean_html(v.get("name")), "url": v.get("url") or "",
+                "snippet": _clean_html(v.get("snippet") or "")}
+               for v in (pages.get("value") or [])]
+        return out or None
+    except Exception:
+        return None
+
+
 def web_search_snippets(query: str, count: int = 3):
-    """轻量网页搜索：Bing 主源，DuckDuckGo 兜底。返回 [{title,snippet,url}] 或 None。"""
+    """轻量网页搜索：博查(配BOCHA_API_KEY) → Bing → DuckDuckGo。
+    返回 [{title,snippet,url}] 或 None。"""
+    if BOCHA_KEY:
+        out = _bocha_search(query, count)
+        if out:
+            return out
     ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         r = requests.get("https://cn.bing.com/search", params={"q": query},
@@ -423,6 +452,67 @@ def web_search_snippets(query: str, count: int = 3):
         return None
 
 
+# ---------------------------------------------- 无账号公开数据源 ----
+# 以下均为网页端公开接口或免费聚合站：无需登录、无需小号，全部带超时与异常兜底。
+# 去哪儿门票频道给"真实景点+挂牌票价+销量热度"；uapis 热榜给"正在热议"的潮流信号。
+
+QUNAR_BASE = "https://piao.qunar.com"
+UAPIS_BASE = "https://uapis.cn"
+
+
+def qunar_scenic(city: str, count: int = 10):
+    """去哪儿门票频道公开榜单：某城在售景点（真实票价/评分/5A级标/销量/地址）。
+    返回 {scenic:[{name,star,score,ticket,intro,addr,sales,lng,lat}], src} 或 None。"""
+    try:
+        r = requests.get(QUNAR_BASE + "/ticket/list.json",
+                         params={"keyword": city, "from": "mpl_search_suggest",
+                                 "page": 1}, headers=_UA, timeout=_TIMEOUT)
+        rows = ((r.json() or {}).get("data") or {}).get("sightList") or []
+        out = []
+        for s in rows:
+            name = s.get("sightName")
+            if not name:
+                continue
+            try:
+                ticket = float(s.get("qunarPrice") or 0)
+            except (TypeError, ValueError):
+                ticket = 0.0
+            if s.get("free"):
+                ticket = 0.0
+            pt = (s.get("point") or "").split(",")
+            out.append({
+                "name": name, "star": s.get("star") or "",
+                "score": s.get("score"), "ticket": ticket,
+                "intro": (s.get("intro") or "")[:30],
+                "addr": (s.get("address") or "")[:40],
+                "sales": s.get("saleCount"),
+                "lng": float(pt[0]) if len(pt) == 2 else None,
+                "lat": float(pt[1]) if len(pt) == 2 else None,
+            })
+            if len(out) >= count:
+                break
+        return {"scenic": out, "src": "qunar"} if out else None
+    except Exception:
+        return None
+
+
+HOT_BOARDS = ("weibo", "zhihu", "douyin", "xiaohongshu", "toutiao")
+
+
+def hot_board(board: str = "weibo", count: int = 15):
+    """uapis.cn 免费聚合热榜（微博/知乎/抖音/小红书/头条等 40+ 榜），免注册免账号。
+    返回 [{rank,title,url,hot}] 或 None。"""
+    try:
+        r = requests.get(UAPIS_BASE + "/api/v1/misc/hotboard",
+                         params={"type": board}, headers=_UA, timeout=_TIMEOUT)
+        items = (r.json() or {}).get("list") or []
+        return [{"rank": x.get("index"), "title": x.get("title"),
+                 "url": x.get("url") or "", "hot": x.get("hot_value")}
+                for x in items[:count]] or None
+    except Exception:
+        return None
+
+
 # ------------------------------------------------- 小红书攻略(可选数据源) ----
 # 本地部署 xiaohongshu-mcp（github.com/xpzouying/xiaohongshu-mcp）后启用：
 # 先用其 login 工具扫码登录小红书账号，再启动服务（默认 :18060，REST 层在
@@ -451,14 +541,46 @@ def _xhs_headers():
     return h
 
 
+_mcp_session = None
+_mcp_init_done = False
+
+
+def _mcp_rpc(method, params, timeout=45):
+    """POST 一个 JSON-RPC；服务端若要求会话（Mcp-Session-Id 头）则先握手。"""
+    global _mcp_session, _mcp_init_done
+    h = {**_xhs_headers(), "Accept": "application/json, text/event-stream"}
+
+    def _call(m, p):
+        hh = dict(h)
+        if _mcp_session:
+            hh["Mcp-Session-Id"] = _mcp_session
+        return requests.post(XHS_API_BASE,
+                             json={"jsonrpc": "2.0", "id": 1,
+                                   "method": m, "params": p},
+                             headers=hh, timeout=timeout)
+
+    if not _mcp_init_done:
+        r = _call("initialize", {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "travel-agent", "version": "1.0"}})
+        _mcp_session = r.headers.get("Mcp-Session-Id")   # 无会话端点返回None
+        _mcp_init_done = True
+        if _mcp_session:                                # 有会话 → 补 initialized 通知
+            try:
+                requests.post(XHS_API_BASE,
+                              json={"jsonrpc": "2.0",
+                                    "method": "notifications/initialized"},
+                              headers={**h, "Mcp-Session-Id": _mcp_session},
+                              timeout=10)
+            except Exception:
+                pass
+    return _call(method, params)
+
+
 def _mcp_tool(name, args=None, timeout=45):
     """极简 MCP Streamable HTTP 客户端：POST JSON-RPC → 解析 JSON 或 SSE 响应，
     提取 tools/call 的 text content（里面是 JSON 字符串则再解析一层）。"""
-    h = {**_xhs_headers(), "Accept": "application/json, text/event-stream"}
-    r = requests.post(XHS_API_BASE,
-                      json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                            "params": {"name": name, "arguments": args or {}}},
-                      headers=h, timeout=timeout)
+    r = _mcp_rpc("tools/call", {"name": name, "arguments": args or {}}, timeout)
     r.raise_for_status()
     if "text/event-stream" in (r.headers.get("content-type") or ""):
         d = None

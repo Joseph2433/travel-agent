@@ -54,6 +54,25 @@ def cities():
             for c in tools.load_cities()]
 
 
+@app.get("/api/geo/provinces")
+def provinces():
+    return {"provinces": apis.PROVINCES}
+
+
+@app.get("/api/geo/cities")
+def geo_cities(province: str):
+    """某省的城市列表：优先高德行政区接口，无key时降级知识库同省城市。"""
+    lst = apis.district_cities(province)
+    if not lst:
+        prov = province.strip().rstrip("省市自治区壮族回族维吾尔") or province
+        lst = [{"name": c["name"], "lat": c["lat"], "lng": c["lng"]}
+               for c in tools.load_cities()
+               if c["province"].startswith(prov[:2])]
+        if not lst:
+            lst = [{"name": prov}]
+    return {"cities": lst}
+
+
 class LocateReq(BaseModel):
     lat: float | None = None
     lng: float | None = None

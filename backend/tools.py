@@ -21,23 +21,28 @@ def load_cities():
 # ----------------------------------------------------------- 工具实现 ----
 
 def resolve_origin(ctx, lat=None, lng=None, city=None, client_ip=None):
-    """定位解析：浏览器坐标 > 指定城市 > 高德IP定位 > 默认上海。"""
+    """定位解析：指定城市 > 浏览器坐标 > 高德IP定位 > 默认上海。
+    城市不在知识库时：用前端传来的坐标，或高德地理编码兜底。"""
     cities = load_cities()
-    if lat is not None and lng is not None:
-        near = min(cities, key=lambda c: geo.haversine_km(lat, lng, c["lat"], c["lng"]))
-        return {"name": near["name"], "province": near["province"],
-                "lat": float(lat), "lng": float(lng), "src": "gps",
-                "note": f"GPS坐标定位，归属最近枢纽「{near['name']}」"}
     if city:
         for c in cities:
             if c["name"] == city.rstrip("市"):
                 return {"name": c["name"], "province": c["province"],
                         "lat": c["lat"], "lng": c["lng"], "src": "manual", "note": "用户手动指定"}
+        if lat is not None and lng is not None:      # 高德行政区选中的非知识库城市
+            return {"name": city.rstrip("市"), "province": "",
+                    "lat": float(lat), "lng": float(lng), "src": "manual",
+                    "note": "用户手动指定（高德行政区）"}
         g = apis.geocode(city)
         if g:
             return {"name": g.get("city") or city, "province": "",
                     "lat": g["lat"], "lng": g["lng"], "src": "amap",
                     "note": f"高德地理编码：{g.get('formatted','')}"}
+    if lat is not None and lng is not None:
+        near = min(cities, key=lambda c: geo.haversine_km(lat, lng, c["lat"], c["lng"]))
+        return {"name": near["name"], "province": near["province"],
+                "lat": float(lat), "lng": float(lng), "src": "gps",
+                "note": f"GPS坐标定位，归属最近枢纽「{near['name']}」"}
     ip_loc = apis.ip_locate(client_ip or "")
     if ip_loc and ip_loc.get("lat"):
         return {"name": ip_loc.get("city") or "未知", "province": ip_loc.get("province", ""),

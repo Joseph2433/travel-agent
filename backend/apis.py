@@ -120,6 +120,41 @@ def weather_live(city_name: str):
         return None
 
 
+def district_cities(province: str):
+    """高德行政区域查询：某省下辖城市列表 [{name, lat, lng}]。
+    直辖市/特区返回自身；无 key 或失败返回 None 由调用方降级。"""
+    if not amap_available():
+        return None
+    prov = province.strip().rstrip("省市自治区壮族回族维吾尔") or province.strip()
+    try:
+        d = _amap_get("/v3/config/district", keywords=prov, subdistrict=1)
+        top = (d.get("districts") or [{}])[0]
+        subs = top.get("districts") or []
+        if prov in _DIRECT or not subs:
+            c = (top.get("center") or "").split(",")
+            return [{"name": prov,
+                     "lng": float(c[0]) if len(c) == 2 else None,
+                     "lat": float(c[1]) if len(c) == 2 else None}]
+        out = []
+        for it in subs:
+            c = (it.get("center") or "").split(",")
+            out.append({"name": (it.get("name") or "").rstrip("市"),
+                        "lng": float(c[0]) if len(c) == 2 else None,
+                        "lat": float(c[1]) if len(c) == 2 else None})
+        return [x for x in out if x["name"]]
+    except Exception:
+        return None
+
+
+_DIRECT = {"北京", "天津", "上海", "重庆", "香港", "澳门", "台湾"}
+
+PROVINCES = ["北京", "天津", "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江",
+             "上海", "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南",
+             "湖北", "湖南", "广东", "广西", "海南", "重庆", "四川", "贵州",
+             "云南", "西藏", "陕西", "甘肃", "青海", "宁夏", "新疆",
+             "香港", "澳门", "台湾"]
+
+
 def poi_search(city: str, keywords: str, poi_type: str = "", count: int = 8):
     """高德 POI 搜索（v5）。返回 [{name, type, addr, rating, cost}]。"""
     if not amap_available():

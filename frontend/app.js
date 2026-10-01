@@ -23,12 +23,27 @@ async function init(){
     else { ld.classList.add("warn"); ll.textContent = "规则模式"; }
   }catch(e){}
   try{
-    const cities = await fetch("/api/cities").then(r => r.json());
-    const sel = $("#selCity");
-    sel.innerHTML = cities.map(c =>
-      `<option value="${c.name}">${c.name} · ${c.province}</option>`).join("");
+    const {provinces} = await fetch("/api/geo/provinces").then(r => r.json());
+    const ps = $("#selProv");
+    ps.innerHTML = provinces.map(p => `<option>${p}</option>`).join("");
+    ps.value = "北京";
+    ps.onchange = () => loadCities(ps.value);
+    await loadCities("北京");
   }catch(e){}
   locateByGPS(true);
+}
+
+/* 省份 → 城市联动：城市列表来自高德行政区接口（后端 /api/geo/cities） */
+async function loadCities(prov){
+  const sel = $("#selCity");
+  sel.innerHTML = `<option>加载中…</option>`;
+  try{
+    const {cities} = await fetch("/api/geo/cities?province=" + encodeURIComponent(prov))
+      .then(r => r.json());
+    sel.innerHTML = cities.map(c =>
+      `<option value="${c.name}" data-lat="${c.lat ?? ""}" data-lng="${c.lng ?? ""}">${c.name}</option>`
+    ).join("") || `<option>${prov}</option>`;
+  }catch(e){ sel.innerHTML = `<option>${prov}</option>`; }
 }
 
 function locateByGPS(silent){
@@ -44,7 +59,14 @@ function locateByGPS(silent){
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({lat: pos.coords.latitude, lng: pos.coords.longitude})
       }).then(r => r.json());
-      $("#selCity").value = r.name;
+      const ps = $("#selProv"), sel = $("#selCity");
+      const hit = [...ps.options].find(o => r.province && r.province.startsWith(o.value.slice(0,2)));
+      if (hit){ ps.value = hit.value; await loadCities(hit.value); }
+      if (![...sel.options].some(o => o.value === r.name)){
+        sel.insertAdjacentHTML("afterbegin",
+          `<option value="${r.name}" data-lat="${r.lat||""}" data-lng="${r.lng||""}">${r.name}</option>`);
+      }
+      sel.value = r.name;
       state.origin = r;
       note.textContent = `已定位：${r.name}（${r.note||"GPS"}）`;
     }catch(e){ note.textContent = "定位失败，请手动选择"; }
@@ -85,8 +107,11 @@ function bindForm(){
 }
 
 function collectParams(){
+  const opt = $("#selCity").selectedOptions[0];
   return {
-    city: $("#selCity").value || null,
+    city: opt ? opt.value : null,
+    lat: opt && opt.dataset.lat ? +opt.dataset.lat : null,
+    lng: opt && opt.dataset.lng ? +opt.dataset.lng : null,
     budget: +$("#budget").value,
     days: state.getDays(),
     transport: $("#chipsTransport .chip.on").dataset.v,

@@ -27,8 +27,13 @@ def scan_destinations(origin_city: str, budget: int, days: int,
     单程耗时h、单程费用、预估总花费、是否在预算内、标签、佳季。
     transport: auto(智能)|train|flight|drive；prefs: 偏好标签如["美食","人文"]。"""
     origin = _city(origin_city)
-    if not origin:
-        return _j({"error": f"出发城市「{origin_city}」不在知识库"})
+    if not origin:                                  # 非知识库城市 → 高德地理编码兜底
+        g = apis.geocode(origin_city)
+        if g and g.get("lat"):
+            origin = {"name": origin_city.rstrip("市"), "province": g.get("city") or "",
+                      "lat": g["lat"], "lng": g["lng"]}
+        else:
+            return _j({"error": f"出发城市「{origin_city}」无法定位"})
     out = T.scan_destinations(None, origin, budget, days,
                               transport or "auto", prefs or [])
     cities = {c["name"]: c for c in T.load_cities()}

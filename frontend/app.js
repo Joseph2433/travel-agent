@@ -2,7 +2,7 @@
 const $ = s => document.querySelector(s);
 const state = { origin: null, dests: [], plans: [], intel: null, map: null };
 
-const ICONS = { pin:"◎", scan:"◈", rank:"✦", search:"⌕", judge:"⚖", rail:"⇄", plan:"▤", brain:"❖", pen:"✎" };
+const ICONS = { pin:"◎", scan:"◈", rank:"✦", search:"⌕", judge:"⚖", rail:"⇄", plan:"▤", brain:"❖", pen:"✎", think:"✧", tool:"⚙", observe:"◉" };
 
 function toast(msg, ms = 2600){
   const t = $("#toast"); t.textContent = msg; t.classList.add("show");

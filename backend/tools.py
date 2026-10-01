@@ -220,16 +220,21 @@ def apply_llm_judge(intel, days, prefs, llm_out):
 
 
 def _real_rail(origin_name, dest_name):
-    """查12306真实车次，选出程/回程各一班。"""
+    """查12306真实车次，选去程(最早出发)/回程(最晚出发)各一班。"""
     data = apis.query_trains(origin_name, dest_name)
     if not data or not data["trains"]:
         return None
     hs = [t for t in data["trains"] if t["kind"] == "高铁"]
     trains = hs or data["trains"]
-    outbound = trains[0]
+    outbound = min(trains, key=lambda t: t.get("dep") or "99:99")  # 最早出发
+    ret = outbound
+    back = apis.query_trains(dest_name, origin_name)               # 回程反方向查
+    if back and back["trains"]:
+        hb = [t for t in back["trains"] if t["kind"] == "高铁"] or back["trains"]
+        ret = max(hb, key=lambda t: t.get("dep") or "")            # 最晚返程
     price = apis.train_price(outbound) or {}
     return {"date": data["date"], "all": trains,
-            "outbound": outbound, "return": trains[-1] if len(trains) > 1 else outbound,
+            "outbound": outbound, "return": ret,
             "price_2nd": price.get("二等座"), "price_1st": price.get("一等座"),
             "src": "12306"}
 

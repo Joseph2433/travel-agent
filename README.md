@@ -11,29 +11,31 @@
 FastAPI 后端  backend/main.py
    │
    ▼
-TravelAgent  backend/agent.py        # 门面：一次请求 = 一次图执行
+TravelAgent  backend/agent.py        # 门面：一次请求 = 一次 LangGraph 图执行
    │
-   ▼  agent_graph.py                  # LangGraph StateGraph 决策图，全程 trace
-   │    推荐图: resolve → scan → rank ─(有key)→ verdict(LLM复核) → END
-   │    方案图: resolve → fetch_intel ─(有key)→ judge_llm → compose
-   │                              └─(无key)→ judge_rule ┘       │
-   │                                          └─(有key)→ polish(LLM文案) → END
-   │ tools.py                       # 定位/扫描/排序/搜索/判断/编排 + LLM结论合并
-   ├─► llm.py   ── OpenAI兼容协议(Kimi/DeepSeek/OpenAI)  需 LLM_API_KEY
-   ├─► apis.py  ── 高德 Web服务(IP定位/地理编码/POI/天气/驾车路径)  需 AMAP_KEY
-   │            ── 12306 queryG/queryTicketPrice  真实车次+余票+票价  无需Key
-   │            ── Bing/DuckDuckGo  攻略网页摘要
-   ├─► geo.py   ── 距离/交通/预算估算模型（无网兜底）
+   ▼  agent_graph.py                  # StateGraph 编排 + trace 采集
+   │    有key: resolve → agent_*(ReAct循环: think→tool→observe→…) → assemble → END
+   │    无key: resolve → scan/fetch_intel → rank/judge_rule → compose → END
+   │
+   ├─► llm.py         ── OpenAI兼容协议(Kimi/DeepSeek/OpenAI)  需 LLM_API_KEY
+   ├─► agent_tools.py ── 暴露给模型的 @tool：scan_destinations / get_city_profile
+   │                     / get_city_intel / query_trains(往返) / estimate_transport
+   │                     / calc_budget / submit_result(终止+结构化提交)
+   ├─► schemas.py     ── pydantic 输出契约（模型只给名字/排序/理由）
+   ├─► tools.py       ── 规则引擎实现（无key兜底）+ LLM结论合并校验
+   ├─► apis.py        ── 高德 Web服务(IP/地理编码/POI/天气/驾车)  需 AMAP_KEY
+   │                  ── 12306 queryG/queryTicketPrice  真实往返车次+余票+票价
+   │                  ── Bing/DuckDuckGo  攻略网页摘要
+   ├─► geo.py         ── 距离/交通/预算估算模型（无网兜底）
    └─► data/cities.json             # 25 目的地知识库（景点/美食/贴士/消费档）
 ```
 
-**LLM 决策点**（有 `LLM_API_KEY` 时启用，失败原地降级规则并在 trace 中标注）：
-
-1. `verdict` 复核排序 —— 模型对规则打分结果给出首推与逐城点评
-2. `judge_llm` 情报取舍 —— 读攻略摘要/天气/POI，决定景点去留与提示
-3. `polish` 方案文案 —— 为每套方案写推荐语（`ai_note`）
-
-所有外部依赖均**带超时和降级**：无 Key、无外网时应用依然完整可用（标注"估算"/"规则"）。
+**真 Agent 模式**（配 `LLM_API_KEY` 后）：模型自主决定调哪些工具、调几次——
+目的地推荐时它自己扫描候选、挑感兴趣的城市深入看画像、打分排序并给首推；
+行程规划时它自己查攻略摘要/天气/POI/12306往返车次，编排 3-5 套差异化方案
+（每天槽位、餐厅景点、档位系数都由它决定），推理与工具调用全程进 trace 回放。
+代码的职责只剩：**校验**（景点名必须存在于知识库，防幻觉）和**算数**
+（票价/预算永不由模型生成）。模型失联/输出不合法时原地降级规则引擎。
 
 ## 运行
 
@@ -51,7 +53,7 @@ cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
 | 变量 | 作用 | 缺省行为 |
 |---|---|---|
 | `AMAP_KEY` | 高德 Web 服务 key（IP定位/POI/天气/驾车） | 估算模型 |
-| `LLM_API_KEY` | 大模型 key（OpenAI 兼容协议） | 规则引擎决策 |
+| `LLM_API_KEY` | 大模型 key（OpenAI 兼容协议，需支持 function calling） | 规则引擎决策 |
 | `LLM_BASE_URL` | 默认 `https://api.moonshot.cn/v1` | — |
 | `LLM_MODEL` | 默认 `kimi-k2-0905-preview` | — |
 

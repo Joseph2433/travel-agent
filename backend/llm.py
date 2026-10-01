@@ -17,8 +17,8 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip()
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.moonshot.cn/v1").strip()
 LLM_MODEL = os.environ.get("LLM_MODEL", "kimi-k2-0905-preview").strip()
 
-_TIMEOUT = 25          # 秒，单次调用上限
-_MAX_TOKENS = 1600
+_TIMEOUT = 45          # 秒，单次调用上限（推理模型慢，放宽）
+_MAX_TOKENS = 4096     # 推理模型会把额度分给 reasoning_content，需留足正文空间
 
 _client = None
 

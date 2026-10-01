@@ -1,13 +1,14 @@
-"""Agent 决策图：LangGraph StateGraph 驱动的两段式工作流。
+"""Agent 决策图：LangGraph 驱动的两段式工作流。
 
-  推荐图  resolve → scan → rank ──(有key)→ verdict ──→ END
-                                 └──(无key)──────────→ END
-  方案图  resolve → fetch_intel ──(有key)→ judge_llm ──┐
-                                 └──(无key)→ judge_rule ┼→ compose ──(有key)→ polish → END
-                                                              └──────(无key)──────────→ END
+【有 LLM key】模型是大脑 —— ReAct 循环自主调工具拿数据、推理、输出结构化决策；
+              代码只做校验（名字必须来自知识库）与算术（预算/票价永不由模型生成）。
+  推荐图  resolve → agent_rank(ReAct: scan/profile → 排序+点评+首推) → END
+  方案图  resolve → agent_plan(ReAct: profile/intel/车次/预算 → 3-5套行程) → assemble → END
+【无 LLM key】固定流水线兜底：
+  推荐图  resolve → scan → rank → END
+  方案图  resolve → fetch_intel → judge_rule → compose → END
 
-节点职责：工具节点只做数据搬运；LLM 节点做语义决策（复核排序 / 情报取舍 / 文案润色），
-每次失败原地降级为规则结果并把降级事实写进 trace，前端可观测。
+模型每次推理/工具调用/观察都会变成 trace 步，前端可回放完整思考过程。
 """
 import json
 import operator
@@ -18,7 +19,10 @@ from typing import Annotated, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+import apis
+import geo
 import llm
+import schemas
 import tools
 
 
@@ -28,12 +32,14 @@ class S(TypedDict, total=False):
     origin: dict
     scanned: list
     ranked: list
-    verdict: dict                   # LLM 复核结论 {pick, why}
+    verdict: dict
     intel: dict
     judged: dict
-    judge_engine: str               # llm | rule | rule-fallback
-    result: dict                    # compose_plans 输出
-    message: str                    # 无可行目的地时的提示
+    judge_engine: str               # llm-agent | rule | rule-fallback
+    agent_out: object               # LLM 结构化输出（PlansOut/RecOut 实例）
+    result: dict                    # {plans, transport, km, resolved_mode}
+    tool_data: dict                 # ReAct 过程中工具返回的原始数据（按工具名）
+    message: str
     trace: Annotated[list, operator.add]
 
 
@@ -58,7 +64,237 @@ def n_resolve(s: S):
                          f"{origin['note']} → {origin['name']}")]}
 
 
-# ------------------------------------------------------------- 推荐图 ------
+# ------------------------------------------------- ReAct（LLM 是大脑） -----
+
+_rec_agent_g = None
+_plan_agent_g = None
+
+
+def _chat_model():
+    from langchain_openai import ChatOpenAI
+    return ChatOpenAI(model=llm.LLM_MODEL, api_key=llm.LLM_API_KEY,
+                    base_url=llm.LLM_BASE_URL.rstrip("/"),
+                    timeout=llm._TIMEOUT, max_tokens=llm._MAX_TOKENS,
+                    temperature=0.3)
+
+
+def _rec_agent():
+    global _rec_agent_g
+    if _rec_agent_g is None:
+        from langgraph.prebuilt import create_react_agent
+        _rec_agent_g = create_react_agent(
+            _chat_model(), tools=__import__("agent_tools").REC_TOOLS,
+            prompt=REC_PROMPT)
+    return _rec_agent_g
+
+
+def _plan_agent():
+    global _plan_agent_g
+    if _plan_agent_g is None:
+        from langgraph.prebuilt import create_react_agent
+        _plan_agent_g = create_react_agent(
+            _chat_model(), tools=__import__("agent_tools").PLAN_TOOLS,
+            prompt=PLAN_PROMPT)
+    return _plan_agent_g
+
+
+REC_PROMPT = """你是「旅图」旅行规划 Agent 的目的地决策大脑。
+
+工作方式：先用工具拿真实数据，推理决策，最后必须调用 submit_result 提交结论。
+1) 调 scan_destinations 获取全部候选的距离/交通方式/耗时/费用/预算匹配
+2) 对感兴趣的候选调 get_city_profile 看景点量、美食、贴士、佳季
+3) 综合维度：预算契合、天数匹配（每天约2-3个景点）、当前月份 vs 佳季、偏好命中、交通效率
+
+最后用 submit_result 提交，payload 结构：
+{"ranking":[{"city":"城市名","score":0-100整数,"comment":"≤25字点评"},...3-6条],
+ "pick":"首推城市名(必须在ranking中)","why":"≤40字理由"}
+
+硬约束：只推荐工具返回中 feasible=true 的城市。"""
+
+PLAN_PROMPT = """你是「旅图」旅行规划 Agent 的行程编排大脑。
+
+工作方式：先用工具调研，推理编排，最后必须调用 submit_result 提交结论。
+1) get_city_profile 看目的地全部景点(名称/时长/门票/推荐度)、美食、贴士、消费档
+2) get_city_intel 拿实时天气、热门POI、网络攻略摘要
+3) 出行方式为 train/auto 时调 query_trains 拿真实车次票价；其他方式调 estimate_transport
+4) 编排 3-5 套差异化方案（主题如：经典全景/寻味美食/深度慢游/精华快闪/舒适度假，可按目的地特点自由命名）：
+   - 每套 days 数量 = 用户天数；每天排 景点/美食/休闲 槽位（上午/下午/晚上/全天/午餐/晚餐）
+   - 景点名必须精确等于知识库 attractions 的名称；美食名必须精确等于 foods 的名称
+   - 不要排往返交通项（系统会自动插入首尾两天）；抵达日少排点、返程日只排上午
+   - hotel_factor(0.8穷游/1.0标准/1.3+舒适) 和 food_factor 用来区分方案档位
+   - 可以调 calc_budget 自检每套方案总价是否贴合预算
+
+最后用 submit_result 提交，payload 结构：
+{"plans":[{"name":"≤8字方案名","pace":"节奏","desc":"≤25字定位","hotel_factor":1.0,
+           "food_factor":1.0,"days":[{"day":1,"title":"当日标题","items":[
+           {"slot":"上午","type":"景点","name":"知识库中的精确名称"}]}]}],
+ "notes":["出行提示3-5条"],"dropped":[{"name":"剔除景点名","reason":"理由"}]}
+
+硬约束：真实景点/美食名只能从工具数据中选，不要编造。"""
+
+
+def _msg_trace(msgs):
+    """把 ReAct 消息流翻译成前端 trace 步：思考 / 调工具 / 观察。"""
+    steps = []
+    for m in msgs:
+        mtype = getattr(m, "type", "")
+        if mtype == "ai":
+            rc = (getattr(m, "additional_kwargs", None) or {}).get("reasoning_content")
+            if isinstance(rc, str) and rc.strip():
+                steps.append(_t("think", "模型推理",
+                                " ".join(rc.split())[:110] + "…"))
+            for tc in getattr(m, "tool_calls", None) or []:
+                args = json.dumps(tc.get("args") or {}, ensure_ascii=False)
+                steps.append(_t("tool", f"调用工具 {tc['name']}", args[:80]))
+        elif mtype == "tool":
+            body = m.content if isinstance(m.content, str) else str(m.content)
+            steps.append(_t("observe", f"观察 {getattr(m,'name','tool')} 返回",
+                            " ".join(body.split())[:80]))
+    return steps
+
+
+def _collect_tool_data(msgs):
+    """从消息流里回收工具返回数据（按工具名，同名取最后一次）。"""
+    data = {}
+    for m in msgs:
+        if getattr(m, "type", "") == "tool" and getattr(m, "name", None):
+            try:
+                data[m.name] = json.loads(m.content)
+            except Exception:
+                data[m.name] = m.content
+    return data
+
+
+def _run_react(agent, user_msg):
+    """执行 ReAct 图；返回 (messages, 异常或None)。"""
+    try:
+        r = agent.invoke({"messages": [("user", user_msg)]},
+                         config={"recursion_limit": 30})
+        return r.get("messages", []), None
+    except Exception as e:
+        return [], e
+
+
+def _extract_structured(msgs, cls):
+    """从消息流提取 submit_result 工具调用的 payload，校验为 pydantic 模型；
+    模型没调用时兜底解析最后一条 AI 文本中的 JSON。"""
+    for m in reversed(msgs):
+        if getattr(m, "type", "") != "ai":
+            continue
+        for tc in getattr(m, "tool_calls", None) or []:
+            if tc.get("name") == "submit_result" and isinstance(
+                    tc.get("args"), dict):
+                try:
+                    return cls(**tc["args"].get("payload", tc["args"]))
+                except Exception:
+                    return None
+    for m in reversed(msgs):                        # 兜底：最后一条AI文本里的JSON
+        if getattr(m, "type", "") == "ai" and getattr(m, "content", None):
+            txt = m.content if isinstance(m.content, str) else ""
+            i, j = txt.find("{"), txt.rfind("}")
+            if i >= 0 and j > i:
+                try:
+                    return cls(**json.loads(txt[i:j + 1]))
+                except Exception:
+                    return None
+    return None
+
+
+# --------------------------------------------- 推荐图：LLM 自主决策 --------
+
+def n_agent_rank(s: S):
+    """LLM Agent：自主调工具调研候选，输出排序+点评+首推。"""
+    req, origin = s["req"], s["origin"]
+    user_msg = json.dumps({
+        "出发地": origin["name"], "预算": req["budget"], "天数": req["days"],
+        "出行方式": req.get("transport", "auto"), "偏好": req.get("prefs") or [],
+        "当前月份": datetime.now().month,
+    }, ensure_ascii=False)
+
+    msgs, err = _run_react(_rec_agent(), user_msg)
+    steps = _msg_trace(msgs)
+    out = _extract_structured(msgs, schemas.RecOut)
+    if err:
+        steps.append(_t("brain", "LLM 调研", f"调用失败：{str(err)[:60]}，转规则引擎"))
+        return _rule_rank_pipeline(s, steps)
+
+    ranking = getattr(out, "ranking", None) if out else None
+    if not ranking:
+        steps.append(_t("brain", "LLM 调研", "输出不合法，转规则引擎"))
+        return _rule_rank_pipeline(s, steps)
+
+    # 合并：模型给排序/分数/点评/首推，代码回填真实距离/费用/交通
+    scanned = {x["city"]: x for x in
+               tools.scan_destinations(None, origin, req["budget"], req["days"],
+                                       req.get("transport", "auto"),
+                                       req.get("prefs") or []) if x["feasible"]}
+    cities = {c["name"]: c for c in tools.load_cities()}
+    dests = []
+    for item in ranking[:6]:
+        name = item.city.rstrip("市")
+        sc, c = scanned.get(name), cities.get(name)
+        if not sc or not c:
+            continue
+        dests.append({
+            "city": name, "province": c["province"],
+            "score": max(0, min(100, int(item.score))),
+            "km": sc["km"], "lat": c["lat"], "lng": c["lng"],
+            "tags": c["tags"], "transport_est": sc["transport_est"],
+            "rough_total": sc["rough_total"], "hotelPerNight": c["hotelPerNight"],
+            "reasons": _rule_reasons(sc, c, req),
+            "ai_comment": (item.comment or "")[:40],
+            "llm_pick": name == (getattr(out, "pick", "") or "").rstrip("市"),
+        })
+    if len(dests) < 3:
+        steps.append(_t("brain", "LLM 调研", "有效推荐不足3个，转规则引擎"))
+        return _rule_rank_pipeline(s, steps)
+
+    verdict = {"pick": (out.pick or "").rstrip("市"),
+               "why": str(out.why or "")[:60]}
+    steps.append(_t("brain", "LLM 决策完成",
+                    f"调研 {len([m for m in msgs if getattr(m,'type','')=='tool'])} 次工具，"
+                    f"首推「{verdict['pick'] or dests[0]['city']}」"))
+    return {"ranked": dests, "verdict": verdict, "trace": steps}
+
+
+def _rule_reasons(sc, c, req):
+    """给 LLM 选中的城市补上数字理由条（预算/天数/季节/偏好）。"""
+    reasons, month = [], datetime.now().month
+    if sc["rough_total"] <= req["budget"]:
+        reasons.append(f"预算内（约¥{sc['rough_total']}）")
+    else:
+        reasons.append(f"略超预算（约¥{sc['rough_total']}）")
+    if month in c["bestMonths"]:
+        reasons.append("正值佳季")
+    hit = set(req.get("prefs") or []) & set(c["tags"])
+    if hit:
+        reasons.append("契合偏好：" + "、".join(hit))
+    return reasons
+
+
+def _rule_rank_pipeline(s: S, prior_steps):
+    """规则兜底：scan+rank 内联执行。"""
+    req = s["req"]
+    scanned = tools.scan_destinations(None, s["origin"], req["budget"], req["days"],
+                                      req.get("transport", "auto"),
+                                      req.get("prefs") or [])
+    feas = [x for x in scanned if x["feasible"]]
+    steps = prior_steps + [
+        _t("scan", "扫描候选目的地",
+           f"共评估 {len(scanned)} 个目的地，{len(feas)} 个满足硬约束")]
+    out = {"scanned": scanned, "trace": steps}
+    if not feas:
+        out["message"] = "当前条件下没有可行的目的地，建议提高预算或放宽出行方式"
+        return out
+    ranked = tools.rank_destinations(None, scanned, req["budget"], req["days"],
+                                     req.get("prefs") or [])
+    out["ranked"] = ranked
+    out["trace"] = steps + [_t("rank", "多因子打分排序",
+                              "、".join(f"{r['city']}({r['score']})" for r in ranked[:5]))]
+    return out
+
+
+# 规则流水线节点（无 key 时使用）---------------------------------------------
 
 def n_scan(s: S):
     req = s["req"]
@@ -66,10 +302,11 @@ def n_scan(s: S):
                                       req.get("transport", "auto"),
                                       req.get("prefs") or [])
     feas = [x for x in scanned if x["feasible"]]
-    detail = (f"共评估 {len(scanned)} 个目的地，{len(feas)} 个满足"
-              f"「{_mode_label(req.get('transport','auto'))} + ¥{req['budget']}"
-              f" + {req['days']}天」硬约束")
-    out = {"scanned": scanned, "trace": [_t("scan", "扫描候选目的地", detail)]}
+    out = {"scanned": scanned,
+           "trace": [_t("scan", "扫描候选目的地",
+                        f"共评估 {len(scanned)} 个目的地，{len(feas)} 个满足"
+                        f"「{_mode_label(req.get('transport','auto'))} + ¥{req['budget']}"
+                        f" + {req['days']}天」硬约束")]}
     if not feas:
         out["message"] = "当前条件下没有可行的目的地，建议提高预算或放宽出行方式"
     return out
@@ -84,65 +321,248 @@ def n_rank(s: S):
                          "、".join(f"{r['city']}({r['score']})" for r in ranked[:5]))]}
 
 
-def n_verdict(s: S):
-    """LLM 决策节点①：复核规则排序，给出首推与逐城点评。"""
-    req, ranked = s["req"], s["ranked"]
-    payload = {
-        "出发地": s["origin"]["name"], "预算": req["budget"], "天数": req["days"],
-        "出行方式": _mode_label(req.get("transport", "auto")),
-        "偏好": req.get("prefs") or [], "当前月份": datetime.now().month,
-        "候选": [{"城市": r["city"], "规则得分": r["score"], "距离km": round(r["km"]),
-                  "标签": r["tags"], "预估总花费": r["rough_total"],
-                  "交通": r["transport_est"]["desc"]} for r in ranked],
-    }
-    d = llm.chat_json(
-        "你是资深旅行规划师。下面是规则引擎按预算/天数/季节/偏好打分排序的目的地候选。"
-        "请复核：结合时令、偏好契合度与性价比，选出你的首推（可不同于得分第一名），"
-        "并对每个候选给一句点评。",
-        json.dumps(payload, ensure_ascii=False)
-        + '\n输出格式：{"pick":"首选城市名(必须来自候选)","why":"≤40字推荐理由",'
-          '"comments":{"城市名":"≤25字点评"}}')
-    valid = {r["city"] for r in ranked}
-    if not d:
-        return {"trace": [_t("brain", "LLM 复核排序", "模型未响应，采用规则排序")]}
-    pick = d.get("pick") if d.get("pick") in valid else None
-    comments = d.get("comments") if isinstance(d.get("comments"), dict) else {}
-    for r in ranked:
-        c = comments.get(r["city"])
-        if isinstance(c, str) and c.strip():
-            r["ai_comment"] = c.strip()[:40]
-        if pick and r["city"] == pick:
-            r["llm_pick"] = True
-    verdict = {"pick": pick, "why": str(d.get("why") or "")[:60]}
-    return {"ranked": ranked, "verdict": verdict,
-            "trace": [_t("brain", "LLM 复核排序",
-                         (f"首推「{pick}」：{verdict['why']}" if pick
-                          else "维持规则排序，无额外首推"))]}
+def _route_rec(s: S):
+    return "agent_rank" if llm.llm_available() else "scan"
 
 
 def _scan_has_feasible(s: S):
     return "rank" if any(x["feasible"] for x in s["scanned"]) else END
 
 
-def _llm_or_end(s: S):
-    return "verdict" if llm.llm_available() else END
-
-
 def build_recommend():
     g = StateGraph(S)
     g.add_node("resolve", n_resolve)
+    g.add_node("agent_rank", n_agent_rank)
     g.add_node("scan", n_scan)
     g.add_node("rank", n_rank)
-    g.add_node("verdict", n_verdict)
     g.add_edge(START, "resolve")
-    g.add_edge("resolve", "scan")
+    g.add_conditional_edges("resolve", _route_rec,
+                            {"agent_rank": "agent_rank", "scan": "scan"})
+    g.add_edge("agent_rank", END)
     g.add_conditional_edges("scan", _scan_has_feasible, {"rank": "rank", END: END})
-    g.add_conditional_edges("rank", _llm_or_end, {"verdict": "verdict", END: END})
-    g.add_edge("verdict", END)
+    g.add_edge("rank", END)
     return g.compile()
 
 
-# ------------------------------------------------------------- 方案图 ------
+# --------------------------------------------- 方案图：LLM 自主编排 --------
+
+def n_agent_plan(s: S):
+    """LLM Agent：自主调研目的地（画像/情报/车次/预算），输出 3-5 套行程。"""
+    req, origin = s["req"], s["origin"]
+    user_msg = json.dumps({
+        "出发地": origin["name"], "目的地": req["dest"], "预算": req["budget"],
+        "天数": req["days"], "出行方式": req.get("transport", "auto"),
+        "偏好": req.get("prefs") or [], "当前月份": datetime.now().month,
+    }, ensure_ascii=False)
+
+    msgs, err = _run_react(_plan_agent(), user_msg)
+    steps = _msg_trace(msgs)
+    tool_data = _collect_tool_data(msgs)
+    out = _extract_structured(msgs, schemas.PlansOut)
+    if err or not out or not getattr(out, "plans", None):
+        why = f"调用失败：{str(err)[:60]}" if err else "输出不合法"
+        steps.append(_t("judge", "LLM 编排", f"{why}，转规则引擎"))
+        # 原地降级到规则流水线
+        intel = tools.fetch_intel(None, req["dest"])
+        judged = tools.judge_intel(None, intel, req["days"], req.get("prefs") or [])
+        result = tools.compose_plans(None, origin, req["dest"], req["budget"],
+                                     req["days"], req.get("transport", "auto"),
+                                     req.get("prefs") or [], judged)
+        return {"intel": intel, "judged": judged, "result": result,
+                "judge_engine": "rule-fallback", "tool_data": tool_data,
+                "trace": steps + _compose_trace(result, req)}
+
+    return {"agent_out": out, "tool_data": tool_data, "trace": steps}
+
+
+def n_assemble(s: S):
+    """组装校验：模型只给了名字/结构，这里回填真实票价/时长/简介/预算。
+    agent_plan 若已原地降级（无 agent_out），结果已齐，本节点直通。"""
+    out = s.get("agent_out")
+    if out is None:
+        return {}
+    req, origin = s["req"], s["origin"]
+    tool_data = s.get("tool_data") or {}
+    c = next(x for x in tools.load_cities() if x["name"] == req["dest"].rstrip("市"))
+
+    transport, km, mode = _resolve_transport(origin, c, req, tool_data)
+    att_map = {a["n"]: a for a in c["attractions"]}
+    food_map = {f["n"]: f for f in c["foods"]}
+
+    plans = []
+    for i, p in enumerate(out.plans):
+        days_out, used_tickets = [], 0.0
+        for d in p.days[:req["days"]]:
+            items = []
+            if d.day == 1:
+                items.append({"slot": "上午", "type": "交通",
+                              "name": f"{origin['name']} → {c['name']}",
+                              "note": transport["outbound"], "cost": transport["cost"]})
+            for it in d.items:
+                mapped = _map_item(it, att_map, food_map)
+                if mapped:
+                    items.append(mapped)
+                    if mapped.get("_ticket"):
+                        used_tickets += mapped.pop("_ticket")
+            if d.day == req["days"]:
+                items.append({"slot": "下午", "type": "交通",
+                              "name": f"{c['name']} → {origin['name']} 返程",
+                              "note": transport["back"], "cost": transport["cost"]})
+            title = (d.title or "").strip() or tools._day_title(
+                d.day, req["days"], [a for a in c["attractions"]
+                                     if any(i["name"] == a["n"] for i in items)])
+            days_out.append({"day": d.day, "title": title[:14], "items": items})
+        if not days_out:
+            continue
+        b = geo.trip_budget(c, req["days"], transport["cost"],
+                            hotel_factor=getattr(p, "hotel_factor", 1.0) or 1.0,
+                            food_factor=getattr(p, "food_factor", 1.0) or 1.0,
+                            attraction_ticket_sum=used_tickets)
+        over = b["total"] > req["budget"]
+        plans.append({
+            "id": f"agent{i}", "name": p.name[:12], "desc": (p.desc or "")[:30],
+            "pace": (p.pace or "适中")[:6], "days": days_out,
+            "transport": transport, "budget": b, "fits_budget": not over,
+            "over_hint": f"约超¥{b['total'] - req['budget']}，建议降低住宿或餐饮档位" if over else "",
+        })
+
+    if len(plans) < 3:                          # 质量不达标 → 规则兜底
+        intel = tools.fetch_intel(None, req["dest"])
+        judged = tools.judge_intel(None, intel, req["days"], req.get("prefs") or [])
+        result = tools.compose_plans(None, origin, req["dest"], req["budget"],
+                                     req["days"], req.get("transport", "auto"),
+                                     req.get("prefs") or [], judged)
+        return {"intel": intel, "judged": judged, "result": result,
+                "judge_engine": "rule-fallback",
+                "trace": [_t("judge", "方案校验", "LLM 方案不足3套，转规则编排")
+                          ] + _compose_trace(result, req)}
+
+    # 组装 intel（供前端情报条）：数据来自 ReAct 工具调用的真实返回
+    intel = _intel_from_tools(c, tool_data)
+    dropped = [{"name": d.name, "reason": (d.reason or "")[:30]}
+               for d in (getattr(out, "dropped", None) or [])]
+    notes = [str(n)[:60] for n in (getattr(out, "notes", None) or [])][:5]
+    notes += tools._base_notes(intel)
+    judged = {"notes": notes, "dropped": dropped,
+              "tips": c["tips"], "foods": c["foods"][:5], "kept": []}
+    result = {"plans": plans[:5], "transport": transport, "km": km,
+              "resolved_mode": mode}
+    return {"intel": intel, "judged": judged, "result": result,
+            "judge_engine": "llm-agent",
+            "trace": [_t("judge", "LLM 编排完成",
+                         f"{len(plans)} 套方案通过校验，"
+                         f"剔除 {len(dropped)} 项")
+                      ] + [_t("rail", "查询去程/回程交通",
+                              f"去程 {transport['outbound']}｜回程 {transport['back']}"
+                              f"（{'12306实时' if transport['src']=='12306' else '估算'}）")]}
+
+
+def _resolve_transport(origin, c, req, tool_data):
+    """优先用模型查到的 12306 往返真实车次；模型没查则代码补查，最终兜底估算。"""
+    km = geo.haversine_km(origin["lat"], origin["lng"], c["lat"], c["lng"])
+    est = geo.estimate_transport(km, req.get("transport", "auto"), c)
+    mode = est["mode"]
+    if mode != "train":
+        return ({"mode": mode, "src": "model", "hours": est.get("hours"),
+                 "cost": est["cost"],
+                 "outbound": f"{est['desc']} 约{est.get('hours')}h",
+                 "back": f"{est['desc']} 约{est.get('hours')}h返程",
+                 "trains": []}, km, mode)
+
+    td = tool_data.get("query_trains")
+    fo = td.get("outbound") if isinstance(td, dict) else None
+    ro = td.get("return") if isinstance(td, dict) else None
+    if not (fo and fo.get("trains")):                # 模型没查去程 → 代码补查
+        d = apis.query_trains(origin["name"], c["name"])
+        if d:
+            fo = {"date": d["date"], "trains": [
+                {"code": t["code"], "kind": t["kind"], "from": t["from"],
+                 "to": t["to"], "dep": t["dep"], "arr": t["arr"],
+                 "hours": t["hours"], "seats": t["seats"],
+                 "二等座": (apis.train_price(t) or {}).get("二等座")}
+                for t in d["trains"][:5]]}
+    if not (ro and ro.get("trains")):                # 回程同理补查
+        d = apis.query_trains(c["name"], origin["name"])
+        if d:
+            ro = {"date": d["date"], "trains": [
+                {"code": t["code"], "kind": t["kind"], "from": t["from"],
+                 "to": t["to"], "dep": t["dep"], "arr": t["arr"],
+                 "hours": t["hours"], "seats": t["seats"],
+                 "二等座": (apis.train_price(t) or {}).get("二等座")}
+                for t in d["trains"][:3]]}
+    if not (fo and fo.get("trains")):                # 两个方向都查不到 → 估算
+        return ({"mode": mode, "src": "model", "hours": est.get("hours"),
+                 "cost": est["cost"],
+                 "outbound": f"{est['desc']} 约{est.get('hours')}h",
+                 "back": f"{est['desc']} 约{est.get('hours')}h返程",
+                 "trains": []}, km, mode)
+
+    ob = min(fo["trains"], key=lambda t: t.get("dep") or "99:99")   # 最早去程
+    bk = (max(ro["trains"], key=lambda t: t.get("dep") or "")
+          if ro and ro.get("trains") else None)                     # 最晚回程
+    cost = ob.get("二等座") or (bk or {}).get("二等座") or est["cost"]
+    return ({"mode": "train", "src": "12306", "hours": ob["hours"],
+             "cost": round(cost),
+             "outbound": f"{ob['code']} {ob['from']}{ob['dep']}→{ob['to']}{ob['arr']}",
+             "back": (f"{bk['code']} {bk['from']}{bk['dep']}→{bk['to']}{bk['arr']}"
+                      if bk else "返程车次请到12306查询"),
+             "trains": fo["trains"][:6], "query_date": fo.get("date", "")},
+            km, mode)
+
+
+def _map_item(it, att_map, food_map):
+    """把模型给的名字映射回知识库对象；支持子串模糊匹配，编不出的一律丢弃。"""
+    name, typ = (it.name or "").strip(), (it.type or "景点")
+    if typ == "景点":
+        a = att_map.get(name)
+        if not a:                                   # 模糊匹配一次
+            a = next((v for k, v in att_map.items()
+                      if k in name or name in k), None)
+        if not a:
+            return None
+        return {"slot": it.slot, "type": "景点", "name": a["n"],
+                "note": a["desc"], "cost": a["ticket"],
+                "hours": a["hours"], "_ticket": a["ticket"]}
+    if typ == "美食":
+        f = food_map.get(name) or next(
+            (v for k, v in food_map.items() if k in name or name in k), None)
+        if f:
+            return {"slot": it.slot, "type": "美食", "name": f["n"],
+                    "note": f["d"], "cost": f["p"]}
+        return {"slot": it.slot, "type": "美食", "name": name[:16],
+                "note": "当地特色", "cost": 60}
+    return {"slot": it.slot, "type": "休闲", "name": name[:16],
+            "note": "", "cost": 40}
+
+
+def _intel_from_tools(c, tool_data):
+    """把 ReAct 工具返回还原成前端情报条需要的数据源标注。"""
+    intel = {"city": c, "sources": ["本地知识库"], "weather": None,
+             "web": None, "pois_scenic": None}
+    td = tool_data.get("get_city_intel")
+    if isinstance(td, dict):
+        if td.get("weather"):
+            intel["weather"] = td["weather"]; intel["sources"].append("高德天气")
+        if td.get("pois_scenic"):
+            intel["pois_scenic"] = [{"name": n} for n in td["pois_scenic"]]
+            intel["sources"].append("高德POI")
+        if td.get("web"):
+            intel["web"] = td["web"]; intel["sources"].append("网页搜索")
+    if tool_data.get("query_trains"):
+        intel["sources"].append("12306实时车次")
+    return intel
+
+
+def _compose_trace(result, req):
+    ti = result["transport"]
+    return [_t("rail", "查询去程/回程交通",
+               f"去程 {ti['outbound']}｜回程 {ti['back']}"
+               f"（{'12306实时' if ti['src']=='12306' else '估算'}）"),
+            _t("plan", f"生成 {len(result['plans'])} 套出游方案",
+               "、".join(p["name"] for p in result["plans"]))]
+
+
+# 规则流水线节点（无 key 时使用）---------------------------------------------
 
 def n_fetch_intel(s: S):
     intel = tools.fetch_intel(None, s["req"]["dest"])
@@ -154,120 +574,42 @@ def n_fetch_intel(s: S):
 def n_judge_rule(s: S):
     req = s["req"]
     judged = tools.judge_intel(None, s["intel"], req["days"], req.get("prefs") or [])
-    return {"judged": judged, "judge_engine": "rule",
-            "trace": [_t("judge", "情报判断与取舍（规则引擎）",
-                         _judge_detail(judged))]}
-
-
-def n_judge_llm(s: S):
-    """LLM 决策节点②：读攻略摘要+天气+POI，决定景点取舍。失败降级规则。"""
-    req, intel = s["req"], s["intel"]
-    c = intel["city"]
-    payload = {
-        "城市": c["name"], "旅行天数": req["days"], "当前月份": datetime.now().month,
-        "用户偏好": req.get("prefs") or [],
-        "实时天气": intel.get("weather"),
-        "攻略摘要": [{"标题": w["title"], "摘要": (w.get("snippet") or "")[:120]}
-                     for w in (intel.get("web") or [])[:3]],
-        "高德热门景点": [p["name"] for p in (intel.get("pois_scenic") or [])[:6]],
-        "候选景点": [{"名称": a["n"], "简介": a["desc"], "建议时长h": a["hours"],
-                      "门票": a["ticket"], "推荐度": a["must"]}
-                     for a in c["attractions"]],
-    }
-    d = llm.chat_json(
-        f"你是{c['name']}的资深当地向导。根据实时情报和用户条件，从候选景点中决定"
-        "本次行程保留哪些、剔除哪些。取舍原则：天数有限必做取舍；不合时令/性价比低"
-        "的剔除；恶劣天气倾向室内项目；优先契合用户偏好。",
-        json.dumps(payload, ensure_ascii=False)
-        + '\n输出格式：{"keep":["要保留的景点名"],"drop":[{"name":"剔除景点名",'
-          '"reason":"≤20字理由"}],"notes":["≤30字的当地提示，最多4条"]}')
-    judged = tools.apply_llm_judge(intel, req["days"], req.get("prefs") or [], d) if d else None
-    if judged is None:                      # LLM 失败或输出不合法 → 规则兜底
-        judged = tools.judge_intel(None, intel, req["days"], req.get("prefs") or [])
-        return {"judged": judged, "judge_engine": "rule-fallback",
-                "trace": [_t("judge", "情报判断与取舍（LLM失败→规则兜底）",
-                             _judge_detail(judged))]}
-    return {"judged": judged, "judge_engine": "llm",
-            "trace": [_t("judge", "情报判断与取舍（LLM 决策）",
-                         _judge_detail(judged))]}
-
-
-def _judge_detail(judged):
     kept_n, drop_n = len(judged["kept"]), len(judged["dropped"])
     why = "；".join(d["reason"] for d in judged["dropped"][:2]) or "无"
-    return f"保留 {kept_n} 个核心体验，剔除 {drop_n} 项（{why}）"
+    return {"judged": judged, "judge_engine": "rule",
+            "trace": [_t("judge", "情报判断与取舍（规则引擎）",
+                         f"保留 {kept_n} 个核心体验，剔除 {drop_n} 项（{why}）")]}
 
 
 def n_compose(s: S):
     req = s["req"]
-    rail_hint = ("（正在查询12306真实车次…）"
-                 if req.get("transport") in (None, "auto", "train") else "")
     result = tools.compose_plans(None, s["origin"], req["dest"], req["budget"],
                                  req["days"], req.get("transport", "auto"),
                                  req.get("prefs") or [], s["judged"])
-    ti = result["transport"]
-    return {"result": result, "trace": [
-        _t("rail", "查询去程/回程交通",
-           f"去程 {ti['outbound']}｜回程 {ti['back']}"
-           f"（{'12306实时' if ti['src'] == '12306' else '估算'}）{rail_hint}"),
-        _t("plan", f"生成 {len(result['plans'])} 套出游方案",
-           "、".join(p["name"] for p in result["plans"]))]}
+    return {"result": result, "trace": _compose_trace(result, req)}
 
 
-def n_polish(s: S):
-    """LLM 节点③：给每套方案写推荐语（ai_note），不改结构数据。"""
-    req, result = s["req"], s["result"]
-    plans = result["plans"]
-    payload = {
-        "城市": req["dest"], "天数": req["days"], "用户偏好": req.get("prefs") or [],
-        "方案": [{"id": p["id"], "名称": p["name"], "定位": p["desc"],
-                  "节奏": p["pace"], "总价": p["budget"]["total"],
-                  "行程": ["D%d %s" % (d["day"], "、".join(
-                      i["name"] for i in d["items"] if i["type"] == "景点"))
-                      for d in p["days"]]} for p in plans],
-    }
-    d = llm.chat_json(
-        "你是旅行文案编辑。给每套方案写一条推荐语：≤45字，点明适合什么人/亮点在哪，"
-        "口语化，不夸大，不用emoji。",
-        json.dumps(payload, ensure_ascii=False)
-        + '\n输出格式：{"notes":{"方案id":"推荐语"}}', temperature=0.6)
-    notes = d.get("notes") if isinstance(d, dict) else None
-    n = 0
-    if isinstance(notes, dict):
-        for p in plans:
-            v = notes.get(p["id"])
-            if isinstance(v, str) and v.strip():
-                p["ai_note"] = v.strip()[:60]
-                n += 1
-    return {"result": result,
-            "trace": [_t("pen", "AI 文案润色",
-                         f"为 {n} 套方案生成推荐语" if n else "模型未响应，跳过")]}
-
-
-def _judge_route(s: S):
-    return "judge_llm" if llm.llm_available() else "judge_rule"
-
-
-def _polish_or_end(s: S):
-    return "polish" if llm.llm_available() else END
+def _route_plan(s: S):
+    return "agent_plan" if llm.llm_available() else "fetch_intel"
 
 
 def build_plan():
     g = StateGraph(S)
     g.add_node("resolve", n_resolve)
+    g.add_node("agent_plan", n_agent_plan)
+    g.add_node("assemble", n_assemble)
     g.add_node("fetch_intel", n_fetch_intel)
-    g.add_node("judge_llm", n_judge_llm)
     g.add_node("judge_rule", n_judge_rule)
     g.add_node("compose", n_compose)
-    g.add_node("polish", n_polish)
     g.add_edge(START, "resolve")
-    g.add_edge("resolve", "fetch_intel")
-    g.add_conditional_edges("fetch_intel", _judge_route,
-                            {"judge_llm": "judge_llm", "judge_rule": "judge_rule"})
-    g.add_edge("judge_llm", "compose")
+    g.add_conditional_edges("resolve", _route_plan,
+                            {"agent_plan": "agent_plan",
+                             "fetch_intel": "fetch_intel"})
+    g.add_edge("agent_plan", "assemble")
+    g.add_edge("assemble", END)
+    g.add_edge("fetch_intel", "judge_rule")
     g.add_edge("judge_rule", "compose")
-    g.add_conditional_edges("compose", _polish_or_end, {"polish": "polish", END: END})
-    g.add_edge("polish", END)
+    g.add_edge("compose", END)
     return g.compile()
 
 

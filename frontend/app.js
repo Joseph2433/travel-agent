@@ -2,14 +2,18 @@
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 
-/* 后端地址：默认同源（本地开发/后端托管前端）。
-   拆分部署时：config.js 里写 window.API_BASE，或带 ?api=https://xxx
-   访问一次即写入 localStorage，之后免带参。 */
+/* 后端地址，双配置共存：
+   · 本地开发(localhost/127.0.0.1) → 永远默认同源后端，config.js 不生效；
+   · 线上 Pages → 取 config.js 的 window.API_BASE；
+   · 任何环境都可用 ?api=https://xxx 显式覆盖（写入 localStorage 持久化），
+     ?api=local 清除覆盖还原默认。 */
 const API_BASE = (() => {
   const q = new URLSearchParams(location.search).get("api");
-  if (q) localStorage.setItem("api_base", q.replace(/\/+$/, ""));
-  return (localStorage.getItem("api_base") || window.API_BASE || "")
-    .replace(/\/+$/, "");
+  if (q === "local") localStorage.removeItem("api_base");
+  else if (q) localStorage.setItem("api_base", q.replace(/\/+$/, ""));
+  const saved = localStorage.getItem("api_base") || "";
+  const isLocal = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+  return (saved || (isLocal ? "" : window.API_BASE || "")).replace(/\/+$/, "");
 })();
 
 const state = { origin: null, dests: [], plans: [], intel: null, map: null,

@@ -140,6 +140,16 @@ GitHub Pages 只能跑静态文件，FastAPI 后端（SSE 流式 + 长耗时 Age
 3. 站点地址：`https://<用户名>.github.io/<仓库名>/`
 
 **③ 把前端指向后端**
-- 改 `frontend/config.js` 里的 `window.API_BASE = "https://你的后端地址"` 再 push；或
-- 不改文件：访问 `https://<页地址>/?api=https://后端地址` 一次，地址会写进浏览器
-  localStorage，之后访问免带参（想换后端用 `?api=` 覆盖即可）
+- `frontend/config.js` 已内置线上后端地址（`window.API_BASE`），只对 Pages
+  生效——本地 `python run.py` 访问 localhost 时永远走同源后端，两套配置互不干扰；
+- 也可以不改文件：访问 `https://<页地址>/?api=https://后端地址` 一次即写入浏览器
+  localStorage，`?api=local` 可清除覆盖还原默认。
+
+**两套配置并存**
+
+| | 本地开发 | GitHub Pages 站点 |
+|---|---|---|
+| 入口 | `python run.py` → `127.0.0.1:8000` | `https://<用户名>.github.io/travel-agent/` |
+| 前端请求后端 | 同源（localhost 忽略 config.js） | `config.js` 里的 Render 地址 |
+| 密钥配置 | `.env`（不进仓库） | Render 控制台环境变量 |
+| 小红书源 | `XHS_API_BASE=http://localhost:18060`（本机 mcp） | `https://mcp.aredink.com/mcp` 云端插件，或隧道回本机，或留空自动降级 |

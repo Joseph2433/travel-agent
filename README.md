@@ -69,9 +69,12 @@ cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
 | POST | /api/locate | GPS 坐标 → 最近出发城市 |
 | POST | /api/agent/destinations | 阶段一：推荐目的地（含 trace + AI复核） |
 | POST | /api/agent/plans | 阶段二：搜索+判断+生成 3-5 套方案 |
+| POST | /api/agent/destinations/stream | 同上，SSE 流式：逐步推 trace 事件 |
+| POST | /api/agent/plans/stream | 同上，SSE 流式 |
 
 ## 前端
 
 原生 HTML/CSS/JS 单页（`frontend/`）：极光渐变 Hero、玻璃拟态表单、
-Agent 思考时间线、Leaflet 地图、目的地评分卡（AI首推徽标+点评）、
+**SSE 实时 Agent 思考时间线**（模型每次推理/调工具/观察即时上屏）、
+Leaflet 地图、目的地评分卡（AI首推徽标+点评）、
 方案详情抽屉（真实车次表 + 逐日行程时间轴 + 预算条形图）。

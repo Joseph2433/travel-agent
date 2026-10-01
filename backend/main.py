@@ -6,11 +6,12 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import envload                     # noqa: F401  必须先于 apis/llm 加载 .env
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent import TravelAgent
+import agent
 import apis
 import llm
 import tools
@@ -80,6 +81,26 @@ def plans(req: PlanReq, request: Request):
     agent = TravelAgent()
     ip = request.client.host if request.client else None
     return agent.run_plan(req.model_dump(), client_ip=ip)
+
+
+# ---- SSE 流式端点：逐步推送 Agent 思考/工具调用，done 事件携带完整结果 ----
+
+@app.post("/api/agent/destinations/stream")
+def destinations_stream(req: RecommendReq, request: Request):
+    ip = request.client.host if request.client else None
+    return StreamingResponse(
+        agent.stream_recommend(req.model_dump(), client_ip=ip),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/agent/plans/stream")
+def plans_stream(req: PlanReq, request: Request):
+    ip = request.client.host if request.client else None
+    return StreamingResponse(
+        agent.stream_plan(req.model_dump(), client_ip=ip),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.exception_handler(Exception)

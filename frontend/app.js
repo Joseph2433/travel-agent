@@ -93,24 +93,50 @@ function collectParams(){
   };
 }
 
-/* ── Agent 时间线渲染（逐步显现） ── */
-function showTrace(trace, title){
+/* ── Agent 时间线：SSE 流式实时渲染 ── */
+function beginTrace(title){
   const sec = $("#stageTrace"), list = $("#traceList");
   $("#traceTitle").textContent = title || "Agent 正在思考";
   $("#traceSpinner").classList.remove("done");
   sec.classList.remove("hidden");
   list.innerHTML = "";
   sec.scrollIntoView({behavior: "smooth", block: "start"});
-  trace.forEach((s, i) => {
-    setTimeout(() => {
-      const li = document.createElement("li");
-      li.innerHTML = `<div class="t-title"><span style="color:var(--teal)">${ICONS[s.icon]||"•"}</span> ${s.title}</div>
-                      ${s.detail ? `<div class="t-detail">${s.detail}</div>` : ""}`;
-      list.appendChild(li);
-      if (i === trace.length - 1) $("#traceSpinner").classList.add("done");
-    }, 420 * i + 300);
+}
+function addTraceStep(s){
+  const li = document.createElement("li");
+  li.innerHTML = `<div class="t-title"><span style="color:var(--teal)">${ICONS[s.icon]||"•"}</span> ${s.title}</div>
+                  ${s.detail ? `<div class="t-detail">${s.detail}</div>` : ""}`;
+  $("#traceList").appendChild(li);
+  li.scrollIntoView({behavior:"smooth", block:"nearest"});
+}
+function endTrace(){ $("#traceSpinner").classList.add("done"); }
+
+/* POST + SSE 流读取：每个 step 事件立刻上屏，done 返回完整结果 */
+async function streamPost(url, body, onStep){
+  const resp = await fetch(url, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body)
   });
-  return trace.length * 420 + 400;
+  if (!resp.ok || !resp.body) throw new Error("HTTP " + resp.status);
+  const reader = resp.body.getReader(), dec = new TextDecoder();
+  let buf = "", final = null;
+  while (true){
+    const {done, value} = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, {stream: true});
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0){
+      const raw = buf.slice(0, i); buf = buf.slice(i + 2);
+      const line = raw.split("\n").find(l => l.startsWith("data:"));
+      if (!line) continue;
+      const msg = JSON.parse(line.slice(5).trim());
+      if (msg.type === "step") onStep(msg);
+      else if (msg.type === "done") final = msg.data;
+      else if (msg.type === "error") throw new Error(msg.message || "agent error");
+    }
+  }
+  if (!final) throw new Error("流已结束但未收到结果");
+  return final;
 }
 
 /* ── 阶段一：目的地推荐 ── */
@@ -119,17 +145,15 @@ async function runRecommend(){
   $("#stageDest").classList.add("hidden");
   $("#stagePlans").classList.add("hidden");
   const params = collectParams();
+  beginTrace("Agent → 目的地推荐");
   try{
-    const r = await fetch("/api/agent/destinations", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(params)
-    }).then(r => r.json());
-    if (r.error) throw new Error(r.error);
+    const r = await streamPost("/api/agent/destinations/stream", params, addTraceStep);
+    endTrace();
     state.origin = r.origin; state.dests = r.destinations || [];
-    const wait = showTrace(r.trace, "Agent → 目的地推荐");
-    setTimeout(() => renderDestinations(r), wait);
-    if (!state.dests.length) setTimeout(() => toast(r.message || "没有可行目的地"), wait);
+    renderDestinations(r);
+    if (!state.dests.length) toast(r.message || "没有可行目的地");
   }catch(e){
+    endTrace();
     toast("服务异常：" + e.message);
   }finally{
     btn.disabled = false;
@@ -207,18 +231,14 @@ function renderMap(origin, dests){
 async function runPlans(dest){
   const params = {...collectParams(), dest};
   $("#stagePlans").classList.add("hidden");
-  const wait = showTrace([], `Agent → 正在研究「${dest}」`);
-  $("#traceList").innerHTML = `<li><div class="t-title">正在调用搜索 / 判断 / 编排工具…</div></li>`;
+  beginTrace(`Agent → 正在研究「${dest}」`);
   try{
-    const r = await fetch("/api/agent/plans", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(params)
-    }).then(r => r.json());
-    if (r.error) throw new Error(r.error);
+    const r = await streamPost("/api/agent/plans/stream", params, addTraceStep);
+    endTrace();
     state.plans = r.plans; state.intel = r.intel; state.lastPlanResp = r;
-    showTrace(r.trace, `Agent → 「${dest}」方案已就绪`);
-    setTimeout(() => renderPlans(r), r.trace.length * 420 + 400);
-  }catch(e){ toast("方案生成失败：" + e.message); }
+    $("#traceTitle").textContent = `Agent → 「${dest}」方案已就绪`;
+    renderPlans(r);
+  }catch(e){ endTrace(); toast("方案生成失败：" + e.message); }
 }
 
 function renderPlans(r){

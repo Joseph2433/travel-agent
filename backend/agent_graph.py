@@ -165,14 +165,36 @@ def _collect_tool_data(msgs):
     return data
 
 
-def _run_react(agent, user_msg):
-    """执行 ReAct 图；返回 (messages, 异常或None)。"""
+def _writer():
+    """外层图以 stream_mode='custom' 运行时可用；非流式调用返回 None。"""
     try:
-        r = agent.invoke({"messages": [("user", user_msg)]},
-                         config={"recursion_limit": 30})
-        return r.get("messages", []), None
+        from langgraph.config import get_stream_writer
+        return get_stream_writer()
+    except Exception:
+        return None
+
+
+def _run_react(agent, user_msg):
+    """流式执行 ReAct 子图：每出现一条新消息（思考/工具调用/观察）立刻经
+    custom writer 推给 SSE 通道。返回 (messages, 异常或None, 已推送的steps)。"""
+    w = _writer()
+    msgs, steps = [], []
+    try:
+        for chunk in agent.stream({"messages": [("user", user_msg)]},
+                                  config={"recursion_limit": 30},
+                                  stream_mode="updates"):
+            for _node, upd in chunk.items():
+                if not isinstance(upd, dict):
+                    continue
+                for m in upd.get("messages") or []:
+                    msgs.append(m)
+                    for st in _msg_trace([m]):
+                        steps.append(st)
+                        if w:
+                            w({"type": "step", **st})
+        return msgs, None, steps
     except Exception as e:
-        return [], e
+        return msgs, e, steps
 
 
 def _extract_structured(msgs, cls):
@@ -211,8 +233,7 @@ def n_agent_rank(s: S):
         "当前月份": datetime.now().month,
     }, ensure_ascii=False)
 
-    msgs, err = _run_react(_rec_agent(), user_msg)
-    steps = _msg_trace(msgs)
+    msgs, err, steps = _run_react(_rec_agent(), user_msg)
     out = _extract_structured(msgs, schemas.RecOut)
     if err:
         steps.append(_t("brain", "LLM 调研", f"调用失败：{str(err)[:60]}，转规则引擎"))
@@ -355,8 +376,7 @@ def n_agent_plan(s: S):
         "偏好": req.get("prefs") or [], "当前月份": datetime.now().month,
     }, ensure_ascii=False)
 
-    msgs, err = _run_react(_plan_agent(), user_msg)
-    steps = _msg_trace(msgs)
+    msgs, err, steps = _run_react(_plan_agent(), user_msg)
     tool_data = _collect_tool_data(msgs)
     out = _extract_structured(msgs, schemas.PlansOut)
     if err or not out or not getattr(out, "plans", None):

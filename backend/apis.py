@@ -522,6 +522,11 @@ def hot_board(board: str = "weibo", count: int = 15):
 XHS_API_BASE = os.environ.get("XHS_API_BASE", "").rstrip("/")
 XHS_API_TOKEN = os.environ.get("XHS_API_TOKEN", "").strip()
 
+# xiaohongshu-mcp 背后是单实例无头浏览器，并发调用会互相饿死；
+# 且搜索本身要驱动浏览器跑十几秒，客户端超时不能太短。
+_xhs_lock = threading.Lock()
+_XHS_TIMEOUT = 90
+
 
 def xhs_enabled() -> bool:
     return bool(XHS_API_BASE)
@@ -668,16 +673,17 @@ def xhs_search_notes(keyword: str, sort_by: str = "最多点赞", limit: int = 6
     if not xhs_enabled():
         return None
     try:
-        if _xhs_is_mcp():
-            data = _mcp_tool("search_feeds",
-                             {"keyword": keyword,
-                              "filters": {"sort_by": sort_by}})
-            return {"notes": _xhs_feed_rows(data, limit), "src": "xiaohongshu"}
-        r = requests.post(XHS_API_BASE + "/api/v1/feeds/search",
-                          json={"keyword": keyword, "filters": {"sort_by": sort_by}},
-                          headers=_xhs_headers(), timeout=45)   # 无头浏览器较慢
-        r.raise_for_status()
-        d = r.json() or {}
+        with _xhs_lock:
+            if _xhs_is_mcp():
+                data = _mcp_tool("search_feeds",
+                                 {"keyword": keyword,
+                                  "filters": {"sort_by": sort_by}})
+                return {"notes": _xhs_feed_rows(data, limit), "src": "xiaohongshu"}
+            r = requests.post(XHS_API_BASE + "/api/v1/feeds/search",
+                              json={"keyword": keyword, "filters": {"sort_by": sort_by}},
+                              headers=_xhs_headers(), timeout=_XHS_TIMEOUT)  # 无头浏览器较慢
+            r.raise_for_status()
+            d = r.json() or {}
         if not d.get("success"):
             return {"notes": [], "error": str(d.get("error") or d.get("message"))[:100],
                     "src": "xiaohongshu"}
@@ -691,16 +697,17 @@ def xhs_feed_detail(feed_id: str, xsec_token: str = ""):
     if not xhs_enabled() or not feed_id:
         return None
     try:
-        if _xhs_is_mcp():
-            d = _mcp_tool("get_feed_detail",
-                          {"feed_id": feed_id, "xsec_token": xsec_token,
-                           "load_all_comments": False}, timeout=60)
-        else:
-            r = requests.post(XHS_API_BASE + "/api/v1/feeds/detail",
-                              json={"feed_id": feed_id, "xsec_token": xsec_token,
-                                    "load_all_comments": False},
-                              headers=_xhs_headers(), timeout=45)
-            d = (r.json() or {}).get("data") or {}
+        with _xhs_lock:
+            if _xhs_is_mcp():
+                d = _mcp_tool("get_feed_detail",
+                              {"feed_id": feed_id, "xsec_token": xsec_token,
+                               "load_all_comments": False}, timeout=_XHS_TIMEOUT)
+            else:
+                r = requests.post(XHS_API_BASE + "/api/v1/feeds/detail",
+                                  json={"feed_id": feed_id, "xsec_token": xsec_token,
+                                        "load_all_comments": False},
+                                  headers=_xhs_headers(), timeout=_XHS_TIMEOUT)
+                d = (r.json() or {}).get("data") or {}
         note = d.get("note") or {}
         comments = ((d.get("comments") or {}).get("list")) or []
         return {"title": note.get("title"), "desc": (note.get("desc") or "")[:400],

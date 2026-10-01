@@ -119,7 +119,9 @@ PLAN_PROMPT = """你是「旅图」旅行规划 Agent 的行程编排大脑。
 3) 出行方式为 train/auto 时调 query_trains 拿真实车次票价；其他方式调 estimate_transport
 4) 编排 3-5 套差异化方案（主题如：经典全景/寻味美食/深度慢游/精华快闪/舒适度假，可按目的地特点自由命名）：
    - 每套 days 数量 = 用户天数；每天排 景点/美食/休闲 槽位（上午/下午/晚上/全天/午餐/晚餐）
-   - 景点名必须精确等于知识库 attractions 的名称；美食名必须精确等于 foods 的名称
+   - 景点名可来自知识库 attractions 或 get_city_intel/search_pois 返回的高德POI名称；
+     美食名可来自知识库 foods 或高德美食POI；都可混用，优先选评分高的真实POI
+   - 需要特定类别（博物馆/夜市/古镇/亲子等）时用 search_pois 主动搜索补充
    - 不要排往返交通项（系统会自动插入首尾两天）；抵达日少排点、返程日只排上午
    - hotel_factor(0.8穷游/1.0标准/1.3+舒适) 和 food_factor 用来区分方案档位
    - 可以调 calc_budget 自检每套方案总价是否贴合预算
@@ -154,15 +156,21 @@ def _msg_trace(msgs):
 
 
 def _collect_tool_data(msgs):
-    """从消息流里回收工具返回数据（按工具名，同名取最后一次）。"""
+    """从消息流里回收工具返回数据：{工具名: [各次调用的返回值]}。"""
     data = {}
     for m in msgs:
         if getattr(m, "type", "") == "tool" and getattr(m, "name", None):
             try:
-                data[m.name] = json.loads(m.content)
+                v = json.loads(m.content)
             except Exception:
-                data[m.name] = m.content
+                v = m.content
+            data.setdefault(m.name, []).append(v)
     return data
+
+
+def _last_td(tool_data, name):
+    lst = tool_data.get(name) or []
+    return lst[-1] if lst else None
 
 
 def _writer():
@@ -382,7 +390,18 @@ def n_agent_plan(s: S):
     if err or not out or not getattr(out, "plans", None):
         why = f"调用失败：{str(err)[:60]}" if err else "输出不合法"
         steps.append(_t("judge", "LLM 编排", f"{why}，转规则引擎"))
-        # 原地降级到规则流水线
+        # 原地降级到规则流水线（仅知识库城市有兜底素材）
+        kb = next((x for x in tools.load_cities()
+                   if x["name"] == req["dest"].rstrip("市")), None)
+        if kb is None:
+            return {"intel": {"sources": [], "weather": None, "web": None,
+                              "city": {"name": req["dest"], "tips": []}},
+                    "judged": {"notes": ["该目的地不在知识库，且模型编排失败"],
+                               "dropped": [], "tips": [], "foods": [], "kept": []},
+                    "result": {"plans": [], "transport": {}, "km": 0,
+                               "resolved_mode": req.get("transport", "auto")},
+                    "judge_engine": "rule-fallback", "tool_data": tool_data,
+                    "trace": steps}
         intel = tools.fetch_intel(None, req["dest"])
         judged = tools.judge_intel(None, intel, req["days"], req.get("prefs") or [])
         result = tools.compose_plans(None, origin, req["dest"], req["budget"],
@@ -403,11 +422,14 @@ def n_assemble(s: S):
         return {}
     req, origin = s["req"], s["origin"]
     tool_data = s.get("tool_data") or {}
-    c = next(x for x in tools.load_cities() if x["name"] == req["dest"].rstrip("市"))
+    dest_name = req["dest"].rstrip("市")
+    kb = next((x for x in tools.load_cities() if x["name"] == dest_name), None)
+    c = kb or _pseudo_city(dest_name)
 
     transport, km, mode = _resolve_transport(origin, c, req, tool_data)
     att_map = {a["n"]: a for a in c["attractions"]}
     food_map = {f["n"]: f for f in c["foods"]}
+    poi_map = _poi_map(tool_data)                   # 高德实时POI也可作行程项
 
     plans = []
     for i, p in enumerate(out.plans):
@@ -419,7 +441,7 @@ def n_assemble(s: S):
                               "name": f"{origin['name']} → {c['name']}",
                               "note": transport["outbound"], "cost": transport["cost"]})
             for it in d.items:
-                mapped = _map_item(it, att_map, food_map)
+                mapped = _map_item(it, att_map, food_map, poi_map)
                 if mapped:
                     items.append(mapped)
                     if mapped.get("_ticket"):
@@ -446,7 +468,7 @@ def n_assemble(s: S):
             "over_hint": f"约超¥{b['total'] - req['budget']}，建议降低住宿或餐饮档位" if over else "",
         })
 
-    if len(plans) < 3:                          # 质量不达标 → 规则兜底
+    if len(plans) < 3 and kb:                    # 知识库城市 → 规则兜底
         intel = tools.fetch_intel(None, req["dest"])
         judged = tools.judge_intel(None, intel, req["days"], req.get("prefs") or [])
         result = tools.compose_plans(None, origin, req["dest"], req["budget"],
@@ -489,7 +511,7 @@ def _resolve_transport(origin, c, req, tool_data):
                  "back": f"{est['desc']} 约{est.get('hours')}h返程",
                  "trains": []}, km, mode)
 
-    td = tool_data.get("query_trains")
+    td = _last_td(tool_data, "query_trains")
     fo = td.get("outbound") if isinstance(td, dict) else None
     ro = td.get("return") if isinstance(td, dict) else None
     if not (fo and fo.get("trains")):                # 模型没查去程 → 代码补查
@@ -530,25 +552,73 @@ def _resolve_transport(origin, c, req, tool_data):
             km, mode)
 
 
-def _map_item(it, att_map, food_map):
-    """把模型给的名字映射回知识库对象；支持子串模糊匹配，编不出的一律丢弃。"""
+def _pseudo_city(name):
+    """非知识库目的地：地理编码定位 + 中性消费档，景点/美食完全交给 POI。"""
+    g = apis.geocode(name) or {}
+    return {"name": name, "province": g.get("city") or "",
+            "lat": g.get("lat") or 35.0, "lng": g.get("lng") or 110.0,
+            "hotelPerNight": 300, "foodPerDay": 120, "localPerDay": 40,
+            "attractions": [], "foods": [], "tags": [], "bestMonths": [],
+            "hsRail": True, "airport": True,
+            "tips": ["该目的地不在本地知识库，行程基于高德POI与网络攻略实时编排"]}
+
+
+def _poi_map(tool_data):
+    """汇总 ReAct 中所有 POI 工具返回：{名称: {name,rating,cost,addr}}。"""
+    m = {}
+    for td in (tool_data.get("get_city_intel") or []):
+        if isinstance(td, dict):
+            for p in (td.get("pois_scenic") or []) + (td.get("pois_food") or []):
+                if isinstance(p, dict) and p.get("name"):
+                    m[p["name"]] = p
+    for td in (tool_data.get("search_pois") or []):
+        if isinstance(td, dict):
+            for p in td.get("pois") or []:
+                if isinstance(p, dict) and p.get("name"):
+                    m[p["name"]] = p
+    return m
+
+
+def _poi_cost(p, default):
+    try:
+        return max(0, round(float(p.get("cost") or default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _map_item(it, att_map, food_map, poi_map=None):
+    """把模型给的名字映射回真实对象：知识库 → 高德POI → 丢弃/通配。
+    支持子串模糊匹配；查无实据的景点一律丢弃（防幻觉）。"""
     name, typ = (it.name or "").strip(), (it.type or "景点")
+    poi_map = poi_map or {}
     if typ == "景点":
-        a = att_map.get(name)
-        if not a:                                   # 模糊匹配一次
-            a = next((v for k, v in att_map.items()
-                      if k in name or name in k), None)
-        if not a:
-            return None
-        return {"slot": it.slot, "type": "景点", "name": a["n"],
-                "note": a["desc"], "cost": a["ticket"],
-                "hours": a["hours"], "_ticket": a["ticket"]}
+        a = att_map.get(name) or next(
+            (v for k, v in att_map.items() if k in name or name in k), None)
+        if a:
+            return {"slot": it.slot, "type": "景点", "name": a["n"],
+                    "note": a["desc"], "cost": a["ticket"],
+                    "hours": a["hours"], "_ticket": a["ticket"]}
+        p = poi_map.get(name) or next(
+            (v for k, v in poi_map.items() if k in name or name in k), None)
+        if p:
+            cost = _poi_cost(p, 45)
+            return {"slot": it.slot, "type": "景点", "name": p["name"][:16],
+                    "note": f"高德POI · 评分{p.get('rating') or '—'} · "
+                            f"{(p.get('addr') or '')[:24]}",
+                    "cost": cost, "hours": 3, "_ticket": cost}
+        return None
     if typ == "美食":
         f = food_map.get(name) or next(
             (v for k, v in food_map.items() if k in name or name in k), None)
         if f:
             return {"slot": it.slot, "type": "美食", "name": f["n"],
                     "note": f["d"], "cost": f["p"]}
+        p = poi_map.get(name) or next(
+            (v for k, v in poi_map.items() if k in name or name in k), None)
+        if p:
+            return {"slot": it.slot, "type": "美食", "name": p["name"][:16],
+                    "note": f"高德POI · 评分{p.get('rating') or '—'}",
+                    "cost": _poi_cost(p, 60)}
         return {"slot": it.slot, "type": "美食", "name": name[:16],
                 "note": "当地特色", "cost": 60}
     return {"slot": it.slot, "type": "休闲", "name": name[:16],
@@ -559,16 +629,16 @@ def _intel_from_tools(c, tool_data):
     """把 ReAct 工具返回还原成前端情报条需要的数据源标注。"""
     intel = {"city": c, "sources": ["本地知识库"], "weather": None,
              "web": None, "pois_scenic": None}
-    td = tool_data.get("get_city_intel")
+    td = _last_td(tool_data, "get_city_intel")
     if isinstance(td, dict):
         if td.get("weather"):
             intel["weather"] = td["weather"]; intel["sources"].append("高德天气")
         if td.get("pois_scenic"):
-            intel["pois_scenic"] = [{"name": n} for n in td["pois_scenic"]]
+            intel["pois_scenic"] = td["pois_scenic"]
             intel["sources"].append("高德POI")
         if td.get("web"):
             intel["web"] = td["web"]; intel["sources"].append("网页搜索")
-    if tool_data.get("query_trains"):
+    if _last_td(tool_data, "query_trains"):
         intel["sources"].append("12306实时车次")
     return intel
 

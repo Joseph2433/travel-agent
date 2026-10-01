@@ -171,6 +171,13 @@ async function runRecommend(){
   $("#stageDest").classList.add("hidden");
   $("#stagePlans").classList.add("hidden");
   const params = collectParams();
+  const direct = ($("#inpDest").value || "").trim();
+  if (direct){                       // 指定目的地 → 跳过推荐，直接出方案
+    btn.disabled = false;
+    btn.innerHTML = '开始规划 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+    runPlans(direct.replace(/市$/, ""));
+    return;
+  }
   beginTrace("Agent → 目的地推荐");
   try{
     const r = await streamPost("/api/agent/destinations/stream", params, addTraceStep);

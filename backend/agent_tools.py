@@ -51,28 +51,48 @@ def get_city_profile(city: str):
     建议时长h/门票/推荐度0-5)、特色美食、实用贴士。"""
     c = _city(city)
     if not c:
-        return _j({"error": f"知识库没有「{city}」"})
+        return _j({"error": f"知识库没有「{city}」的画像，请改用 get_city_intel "
+                            f"和 search_pois 获取实时POI数据来编排"})
     return _j({k: c[k] for k in
                ("name", "province", "tags", "bestMonths", "hotelPerNight",
                 "foodPerDay", "attractions", "foods", "tips")})
 
 
+def _poi_rows(ps):
+    return [{"name": p["name"], "rating": p.get("rating"),
+             "cost": p.get("cost"), "addr": (p.get("addr") or "")[:40]}
+            for p in (ps or {}).get("pois") or []]
+
+
 @tool
 def get_city_intel(city: str):
-    """获取某城市实时情报：天气实况、高德热门景点/美食POI、网络攻略摘要。"""
+    """获取某城市实时情报：天气实况、高德热门景点POI(评分/参考价/地址)、
+    热门美食POI、网络攻略摘要。POI 名称可作为行程的景点/美食候选。"""
     name = city.rstrip("市")
     out = {"city": name, "weather": apis.weather_live(name)}
-    ps = apis.poi_search(name, "景点", "110000", 6)
-    if ps and ps["pois"]:
-        out["pois_scenic"] = [p["name"] for p in ps["pois"]]
-    pf = apis.poi_search(name, "特色美食", "050000", 6)
-    if pf and pf["pois"]:
-        out["pois_food"] = [p["name"] for p in pf["pois"]]
+    ps = _poi_rows(apis.poi_search(name, "景点", "110000", 8))
+    if ps:
+        out["pois_scenic"] = ps
+    pf = _poi_rows(apis.poi_search(name, "特色美食", "050000", 8))
+    if pf:
+        out["pois_food"] = pf
     w = apis.web_search_snippets(f"{name}旅游攻略 必去景点 美食", 3)
     if w:
         out["web"] = [{"title": x["title"],
                        "snippet": (x.get("snippet") or "")[:150]} for x in w]
     return _j(out)
+
+
+@tool
+def search_pois(city: str, keywords: str, types: str = "", count: int = 8):
+    """按关键词在某城市搜索高德POI，返回名称/评分/参考价/地址。
+    用于补充特定类别：如 keywords="博物馆"/"夜市"/"古镇"/"亲子乐园"，
+    types 可给高德分类码(110000风景 050000美食 060100购物)，默认不限类别。"""
+    ps = apis.poi_search(city.rstrip("市"), keywords, types, count)
+    rows = _poi_rows(ps)
+    if not rows:
+        return _j({"error": "未找到相关POI", "pois": []})
+    return _j({"pois": rows})
 
 
 @tool
@@ -132,5 +152,5 @@ def submit_result(payload: dict):
 
 
 REC_TOOLS = [scan_destinations, get_city_profile, submit_result]
-PLAN_TOOLS = [get_city_profile, get_city_intel, query_trains,
+PLAN_TOOLS = [get_city_profile, get_city_intel, search_pois, query_trains,
               estimate_transport, calc_budget, submit_result]

@@ -437,11 +437,52 @@ def xhs_enabled() -> bool:
     return bool(XHS_API_BASE)
 
 
+def _xhs_is_mcp() -> bool:
+    """XHS_API_BASE 以 /mcp 结尾 → 走 MCP Streamable HTTP 协议（如 x-mcp
+    插件云端 https://mcp.aredink.com/mcp）；否则走本地 REST 层 /api/v1。"""
+    return XHS_API_BASE.endswith("/mcp")
+
+
 def _xhs_headers():
     h = {**_UA, "Content-Type": "application/json"}
     if XHS_API_TOKEN:
         h["Authorization"] = f"Bearer {XHS_API_TOKEN}"
+        h["X-API-Key"] = XHS_API_TOKEN            # x-mcp 云端用这个头
     return h
+
+
+def _mcp_tool(name, args=None, timeout=45):
+    """极简 MCP Streamable HTTP 客户端：POST JSON-RPC → 解析 JSON 或 SSE 响应，
+    提取 tools/call 的 text content（里面是 JSON 字符串则再解析一层）。"""
+    h = {**_xhs_headers(), "Accept": "application/json, text/event-stream"}
+    r = requests.post(XHS_API_BASE,
+                      json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                            "params": {"name": name, "arguments": args or {}}},
+                      headers=h, timeout=timeout)
+    r.raise_for_status()
+    if "text/event-stream" in (r.headers.get("content-type") or ""):
+        d = None
+        for line in r.text.splitlines():
+            if line.startswith("data:"):
+                try:
+                    d = json.loads(line[5:].strip())
+                except Exception:
+                    pass
+    else:
+        d = r.json()
+    if not isinstance(d, dict):
+        raise RuntimeError("MCP 响应格式异常")
+    if d.get("error"):
+        raise RuntimeError(str(d["error"])[:120])
+    res = d.get("result") or {}
+    texts = [c.get("text") for c in res.get("content") or []
+             if isinstance(c, dict) and c.get("type") == "text"]
+    for t in texts:
+        try:
+            return json.loads(t)
+        except Exception:
+            pass
+    return {"raw": texts[0]} if texts else res
 
 
 def xhs_login_status():
@@ -449,6 +490,12 @@ def xhs_login_status():
     if not xhs_enabled():
         return None
     try:
+        if _xhs_is_mcp():
+            d = _mcp_tool("check_login_status", {}, timeout=20) or {}
+            flag = d.get("is_login", d.get("logged_in", d.get("login")))
+            if flag is None:
+                flag = bool(d.get("username") or d.get("nickname"))
+            return {"logged_in": bool(flag)}
         r = requests.get(XHS_API_BASE + "/api/v1/login/status",
                          headers=_xhs_headers(), timeout=8)
         d = (r.json() or {}).get("data") or {}
@@ -494,10 +541,16 @@ def _xhs_feed_rows(data, limit):
 
 
 def xhs_search_notes(keyword: str, sort_by: str = "最多点赞", limit: int = 6):
-    """POST /api/v1/feeds/search。返回 {notes:[...], src} 或带 error 的 dict。"""
+    """搜索小红书笔记。REST: POST /api/v1/feeds/search；MCP: tools/call search_feeds。
+    返回 {notes:[...], src} 或带 error 的 dict。"""
     if not xhs_enabled():
         return None
     try:
+        if _xhs_is_mcp():
+            data = _mcp_tool("search_feeds",
+                             {"keyword": keyword,
+                              "filters": {"sort_by": sort_by}})
+            return {"notes": _xhs_feed_rows(data, limit), "src": "xiaohongshu"}
         r = requests.post(XHS_API_BASE + "/api/v1/feeds/search",
                           json={"keyword": keyword, "filters": {"sort_by": sort_by}},
                           headers=_xhs_headers(), timeout=45)   # 无头浏览器较慢
@@ -512,15 +565,20 @@ def xhs_search_notes(keyword: str, sort_by: str = "最多点赞", limit: int = 6
 
 
 def xhs_feed_detail(feed_id: str, xsec_token: str = ""):
-    """POST /api/v1/feeds/detail → {title, desc, likes, hot_comments}。"""
+    """笔记详情 → {title, desc, likes, hot_comments}。REST/MCP 双模式。"""
     if not xhs_enabled() or not feed_id:
         return None
     try:
-        r = requests.post(XHS_API_BASE + "/api/v1/feeds/detail",
-                          json={"feed_id": feed_id, "xsec_token": xsec_token,
-                                "load_all_comments": False},
-                          headers=_xhs_headers(), timeout=45)
-        d = (r.json() or {}).get("data") or {}
+        if _xhs_is_mcp():
+            d = _mcp_tool("get_feed_detail",
+                          {"feed_id": feed_id, "xsec_token": xsec_token,
+                           "load_all_comments": False}, timeout=60)
+        else:
+            r = requests.post(XHS_API_BASE + "/api/v1/feeds/detail",
+                              json={"feed_id": feed_id, "xsec_token": xsec_token,
+                                    "load_all_comments": False},
+                              headers=_xhs_headers(), timeout=45)
+            d = (r.json() or {}).get("data") or {}
         note = d.get("note") or {}
         comments = ((d.get("comments") or {}).get("list")) or []
         return {"title": note.get("title"), "desc": (note.get("desc") or "")[:400],

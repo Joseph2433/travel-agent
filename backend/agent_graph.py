@@ -115,7 +115,8 @@ PLAN_PROMPT = """你是「旅图」旅行规划 Agent 的行程编排大脑。
 
 工作方式：先用工具调研，推理编排，最后必须调用 submit_result 提交结论。
 1) get_city_profile 看目的地全部景点(名称/时长/门票/推荐度)、美食、贴士、消费档
-2) get_city_intel 拿实时天气、热门POI、网络攻略摘要
+2) get_city_intel 拿实时天气、热门POI、网络攻略摘要；想参考小红书真实游客笔记
+   （美食店名/避雷/路线细节）可调 search_xhs_notes，未配置时跳过即可
 3) 出行方式为 train/auto 时调 query_trains 拿真实车次票价；其他方式调 estimate_transport
 4) 编排 3-5 套差异化方案（主题如：经典全景/寻味美食/深度慢游/精华快闪/舒适度假，可按目的地特点自由命名）：
    - 每套 days 数量 = 用户天数；每天排 景点/美食/休闲 槽位（上午/下午/晚上/全天/午餐/晚餐）
@@ -637,7 +638,15 @@ def _intel_from_tools(c, tool_data):
             intel["pois_scenic"] = td["pois_scenic"]
             intel["sources"].append("高德POI")
         if td.get("web"):
-            intel["web"] = td["web"]; intel["sources"].append("网页搜索")
+            intel["web"] = list(td["web"]); intel["sources"].append("网页搜索")
+    xhs_td = _last_td(tool_data, "search_xhs_notes")
+    if isinstance(xhs_td, dict) and xhs_td.get("notes"):
+        intel["sources"].append("小红书")
+        for n in xhs_td["notes"][:3]:           # 并进攻略参考列表，前端自动可点
+            (intel["web"] or intel.setdefault("web", [])).append({
+                "title": "小红书 · " + n["title"], "url": n.get("url") or "",
+                "snippet": f"赞{n.get('likes','0')} · @{n.get('author','')}"
+                           + (f"｜{n['excerpt'][:60]}…" if n.get("excerpt") else "")})
     if _last_td(tool_data, "query_trains"):
         intel["sources"].append("12306实时车次")
     return intel

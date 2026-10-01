@@ -20,13 +20,15 @@ TravelAgent  backend/agent.py        # 门面：一次请求 = 一次 LangGraph 
    ├─► llm.py         ── OpenAI兼容协议(Kimi/DeepSeek/OpenAI)  需 LLM_API_KEY
    ├─► agent_tools.py ── 暴露给模型的 @tool：scan_destinations / get_city_profile
    │                     / get_city_intel / search_pois(任意类别POI实时搜索)
+   │                     / search_xhs_notes(小红书攻略笔记，可选源)
    │                     / query_trains(往返) / estimate_transport
    │                     / calc_budget / submit_result(终止+结构化提交)
    ├─► schemas.py     ── pydantic 输出契约（模型只给名字/排序/理由）
    ├─► tools.py       ── 规则引擎实现（无key兜底）+ LLM结论合并校验
    ├─► apis.py        ── 高德 Web服务(IP/地理编码/行政区/POI/天气/驾车)  需 AMAP_KEY
    │                  ── 12306 queryG/queryTicketPrice  真实往返车次+余票+票价
-   │                  ── Bing/DuckDuckGo  攻略网页摘要
+   │                  ── Bing/DuckDuckGo  攻略网页摘要（含 site:xiaohongshu.com 定向）
+   │                  ── 小红书笔记搜索  需本地 xiaohongshu-mcp（可选，XHS_API_BASE）
    ├─► geo.py         ── 距离/交通/预算估算模型（无网兜底）
    └─► data/cities.json             # 25 城种子知识库：画像/消费档兜底，
                                      # 景点美食可由高德POI实时数据取代
@@ -62,6 +64,14 @@ cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
 | `LLM_API_KEY` | 大模型 key（OpenAI 兼容协议，需支持 function calling） | 规则引擎决策 |
 | `LLM_BASE_URL` | 默认 `https://api.moonshot.cn/v1` | — |
 | `LLM_MODEL` | 默认 `kimi-k2-0905-preview` | — |
+| `XHS_API_BASE` | 本地 [xiaohongshu-mcp](https://github.com/xpzouying/xiaohongshu-mcp) 地址，如 `http://localhost:18060`；启用 `search_xhs_notes` 工具让模型查真实攻略笔记 | 跳过小红书源 |
+| `XHS_API_TOKEN` | 该服务设了 `AUTH_TOKEN` 时填 | — |
+
+小红书没有面向普通开发者的官方笔记搜索 API，以上是社区开源方案：下载其
+release 二进制 → 跑 `xiaohongshu-login` 扫码登录自己的小红书账号 → 启动
+`xiaohongshu-mcp`（无头浏览器，默认 :18060），REST 层即被本应用接入。
+注意属第三方逆向方案，账号有风控风险，建议用小号。不配置也完全可用：
+`get_city_intel` 已自动附带 `site:xiaohongshu.com` 的网页搜索结果。
 
 也可以直接 export/set 环境变量（优先级高于 .env）。
 注意：配置在**进程启动时**读取，改完要重启 `python run.py`。

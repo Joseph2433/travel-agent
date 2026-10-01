@@ -38,10 +38,13 @@ class PlanReq(RecommendReq):
 
 @app.get("/api/status")
 def status():
+    xhs = apis.xhs_login_status() if apis.xhs_enabled() else None
     return {
         "amap": apis.amap_available(),
         "llm": llm.llm_available(),
         "llm_model": llm.model_name() if llm.llm_available() else None,
+        "xhs": {"enabled": apis.xhs_enabled(),
+                "logged_in": (xhs or {}).get("logged_in")},
         "cities": len(tools.load_cities()),
         "modes": list(__import__("geo").TRANSPORT_MODES.items()),
     }

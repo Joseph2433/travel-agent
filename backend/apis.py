@@ -381,3 +381,111 @@ def web_search_snippets(query: str, count: int = 3):
                 for i, t in enumerate(titles[:count])] or None
     except Exception:
         return None
+
+
+# ------------------------------------------------- 小红书攻略(可选数据源) ----
+# 本地部署 xiaohongshu-mcp（github.com/xpzouying/xiaohongshu-mcp）后启用：
+# 先用其 login 工具扫码登录小红书账号，再启动服务（默认 :18060，REST 层在
+# /api/v1 下）。未配置 XHS_API_BASE 时全部跳过，不影响其他数据源。
+# 注意：这是第三方逆向方案而非官方 API，仅适合个人学习用途，有风控风险。
+
+XHS_API_BASE = os.environ.get("XHS_API_BASE", "").rstrip("/")
+XHS_API_TOKEN = os.environ.get("XHS_API_TOKEN", "").strip()
+
+
+def xhs_enabled() -> bool:
+    return bool(XHS_API_BASE)
+
+
+def _xhs_headers():
+    h = {**_UA, "Content-Type": "application/json"}
+    if XHS_API_TOKEN:
+        h["Authorization"] = f"Bearer {XHS_API_TOKEN}"
+    return h
+
+
+def xhs_login_status():
+    """{logged_in: True/False/None}；None=服务不可达或状态不明。"""
+    if not xhs_enabled():
+        return None
+    try:
+        r = requests.get(XHS_API_BASE + "/api/v1/login/status",
+                         headers=_xhs_headers(), timeout=8)
+        d = (r.json() or {}).get("data") or {}
+        flag = d.get("is_login", d.get("logged_in", d.get("login")))
+        if flag is None:                        # 字段名不定：拿到用户名视为已登录
+            flag = bool(d.get("username") or d.get("nickname"))
+        return {"logged_in": bool(flag)}
+    except Exception as e:
+        return {"logged_in": None, "error": str(e)[:80]}
+
+
+def _xhs_feed_rows(data, limit):
+    """SearchFeeds 返回规整：兼容 data 为列表 / {feeds:[...]} / {feeds:{_value:[...]}}。"""
+    feeds = data
+    if isinstance(data, dict):
+        feeds = (data.get("feeds") or data.get("items") or
+                 data.get("list") or data.get("notes") or [])
+        if isinstance(feeds, dict):
+            feeds = feeds.get("_value") or feeds.get("value") or []
+    rows = []
+    for f in feeds or []:
+        if not isinstance(f, dict):
+            continue
+        if f.get("modelType") not in (None, "", "note"):
+            continue                            # 滤掉直播卡/热词卡等非笔记
+        card = f.get("noteCard") or f.get("note_card") or {}
+        inter = card.get("interactInfo") or card.get("interact_info") or {}
+        user = card.get("user") or {}
+        fid = f.get("id") or f.get("feed_id") or f.get("noteId") or ""
+        title = card.get("displayTitle") or f.get("title") or ""
+        if not title:
+            continue
+        rows.append({
+            "title": str(title)[:40],
+            "author": user.get("nickname") or user.get("nickName") or "",
+            "likes": str(inter.get("likedCount") or inter.get("liked_count") or "0"),
+            "collects": str(inter.get("collectedCount") or ""),
+            "feed_id": fid,
+            "xsec_token": f.get("xsecToken") or f.get("xsec_token") or "",
+            "url": f"https://www.xiaohongshu.com/explore/{fid}" if fid else "",
+        })
+    return rows[:limit]
+
+
+def xhs_search_notes(keyword: str, sort_by: str = "最多点赞", limit: int = 6):
+    """POST /api/v1/feeds/search。返回 {notes:[...], src} 或带 error 的 dict。"""
+    if not xhs_enabled():
+        return None
+    try:
+        r = requests.post(XHS_API_BASE + "/api/v1/feeds/search",
+                          json={"keyword": keyword, "filters": {"sort_by": sort_by}},
+                          headers=_xhs_headers(), timeout=45)   # 无头浏览器较慢
+        r.raise_for_status()
+        d = r.json() or {}
+        if not d.get("success"):
+            return {"notes": [], "error": str(d.get("error") or d.get("message"))[:100],
+                    "src": "xiaohongshu"}
+        return {"notes": _xhs_feed_rows(d.get("data"), limit), "src": "xiaohongshu"}
+    except Exception as e:
+        return {"notes": [], "error": str(e)[:100], "src": "xiaohongshu"}
+
+
+def xhs_feed_detail(feed_id: str, xsec_token: str = ""):
+    """POST /api/v1/feeds/detail → {title, desc, likes, hot_comments}。"""
+    if not xhs_enabled() or not feed_id:
+        return None
+    try:
+        r = requests.post(XHS_API_BASE + "/api/v1/feeds/detail",
+                          json={"feed_id": feed_id, "xsec_token": xsec_token,
+                                "load_all_comments": False},
+                          headers=_xhs_headers(), timeout=45)
+        d = (r.json() or {}).get("data") or {}
+        note = d.get("note") or {}
+        comments = ((d.get("comments") or {}).get("list")) or []
+        return {"title": note.get("title"), "desc": (note.get("desc") or "")[:400],
+                "likes": (note.get("interactInfo") or {}).get("likedCount"),
+                "hot_comments": [(c.get("content") or "")[:80]
+                                 for c in comments[:3]]}
+    except Exception:
+        return None

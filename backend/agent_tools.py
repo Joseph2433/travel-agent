@@ -67,7 +67,8 @@ def _poi_rows(ps):
 @tool
 def get_city_intel(city: str):
     """获取某城市实时情报：天气实况、高德热门景点POI(评分/参考价/地址)、
-    热门美食POI、网络攻略摘要。POI 名称可作为行程的景点/美食候选。"""
+    热门美食POI、网络攻略摘要（含小红书被索引的笔记）。POI 名称可作为行程的
+    景点/美食候选。"""
     name = city.rstrip("市")
     out = {"city": name, "weather": apis.weather_live(name)}
     ps = _poi_rows(apis.poi_search(name, "景点", "110000", 8))
@@ -76,10 +77,17 @@ def get_city_intel(city: str):
     pf = _poi_rows(apis.poi_search(name, "特色美食", "050000", 8))
     if pf:
         out["pois_food"] = pf
-    w = apis.web_search_snippets(f"{name}旅游攻略 必去景点 美食", 3)
-    if w:
-        out["web"] = [{"title": x["title"],
-                       "snippet": (x.get("snippet") or "")[:150]} for x in w]
+    web = []
+    for i in apis.web_search_snippets(f"{name}旅游攻略 必去景点 美食", 3) or []:
+        web.append({"title": i["title"], "snippet": (i.get("snippet") or "")[:150],
+                    "url": i.get("url") or "", "src": "web"})
+    for i in apis.web_search_snippets(f"site:xiaohongshu.com {name} 旅游", 3) or []:
+        if "xiaohongshu.com" not in (i.get("url") or ""):
+            continue                                # 搜索引擎不保证按站点过滤，手动核
+        web.append({"title": i["title"], "snippet": (i.get("snippet") or "")[:150],
+                    "url": i["url"], "src": "xhs-web"})
+    if web:
+        out["web"] = web
     return _j(out)
 
 
@@ -93,6 +101,36 @@ def search_pois(city: str, keywords: str, types: str = "", count: int = 8):
     if not rows:
         return _j({"error": "未找到相关POI", "pois": []})
     return _j({"pois": rows})
+
+
+@tool
+def search_xhs_notes(city: str, topic: str = "旅游攻略",
+                     sort_by: str = "最多点赞", with_detail: bool = False):
+    """搜索小红书真实攻略笔记作编排参考：返回标题/作者/点赞/收藏/笔记链接；
+    with_detail=True 时附前2篇的正文摘录与热门评论（更慢但更具体，适合深挖
+    美食店名、避雷提示、路线细节）。topic 可自定义如 '美食'/'避雷'/'两日游路线'；
+    sort_by: 综合|最新|最多点赞|最多收藏。需本地运行 xiaohongshu-mcp 服务。"""
+    if not apis.xhs_enabled():
+        return _j({"error": "小红书数据源未配置（本地部署 xiaohongshu-mcp 并设 "
+                            "XHS_API_BASE 后可用）。请改用 get_city_intel 的网络"
+                            "攻略摘要与 search_pois 获取参考信息"})
+    st = apis.xhs_login_status()
+    if st and st.get("logged_in") is False:
+        return _j({"error": "xiaohongshu-mcp 在线但未登录小红书，需先运行其登录工具扫码"})
+    kw = f"{city.rstrip('市')} {topic}".strip()
+    res = apis.xhs_search_notes(kw, sort_by=sort_by, limit=6)
+    if not res or res.get("error"):
+        return _j({"error": f"小红书搜索失败：{(res or {}).get('error') or '服务不可达'}"})
+    notes = res["notes"]
+    if not notes:
+        return _j({"keyword": kw, "notes": [], "tip": "未搜到相关笔记，换个 topic 试试"})
+    if with_detail:
+        for n in notes[:2]:
+            d = apis.xhs_feed_detail(n.get("feed_id"), n.get("xsec_token"))
+            if d:
+                n["excerpt"], n["hot_comments"] = d["desc"], d["hot_comments"]
+    return _j({"keyword": kw, "notes": notes,
+               "tip": "笔记里的店名/景点可先用 search_pois 核实真实存在后再编入行程"})
 
 
 @tool
@@ -152,5 +190,5 @@ def submit_result(payload: dict):
 
 
 REC_TOOLS = [scan_destinations, get_city_profile, submit_result]
-PLAN_TOOLS = [get_city_profile, get_city_intel, search_pois, query_trains,
-              estimate_transport, calc_budget, submit_result]
+PLAN_TOOLS = [get_city_profile, get_city_intel, search_pois, search_xhs_notes,
+              query_trains, estimate_transport, calc_budget, submit_result]

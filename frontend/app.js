@@ -162,15 +162,7 @@ async function init(){
     if (me.auth){ ME = me; applyMe(); }
     hideAuth();
   }catch(e){ return; }                   // 401 → 登录门已显示，中止初始化
-  try{
-    const st = await apiFetch("/api/status").then(r => r.json());
-    const dot = $("#dotAmap"), lbl = $("#lblAmap");
-    if (st.amap){ dot.classList.add("ok"); lbl.textContent = "高德API"; }
-    else { dot.classList.add("warn"); lbl.textContent = "高德(未配Key)"; }
-    const ld = $("#dotLlm"), ll = $("#lblLlm");
-    if (st.llm){ ld.classList.add("ok"); ll.textContent = "AI决策 · " + (st.llm_model || ""); }
-    else { ld.classList.add("warn"); ll.textContent = "规则模式"; }
-  }catch(e){}
+  try{ await apiFetch("/api/status"); }catch(e){}   // 唤醒后端（Render 冷启动）
   try{
     const {provinces} = await apiFetch("/api/geo/provinces").then(r => r.json());
     const ps = $("#selProv");

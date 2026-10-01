@@ -27,9 +27,6 @@ button{font-family:inherit;cursor:pointer;border:none;background:none}
 .brand-name{font-family:var(--serif);font-size:22px;font-weight:900;letter-spacing:2px}
 .brand-sub{font-size:11px;color:var(--ink3);letter-spacing:2px;margin-top:6px}
 .nav-status{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink3)}
-.dot{width:7px;height:7px;border-radius:50%;background:#ccc;margin-left:10px}
-.dot.ok{background:var(--teal)}
-.dot.warn{background:var(--amber)}
 
 /* ── Hero ── */
 .hero{position:relative;padding:130px 0 90px;overflow:hidden;

@@ -377,3 +377,20 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 .u-add select{min-width:0;padding:8px 6px;font-size:13px}
 .u-add .btn{padding:8px 16px;font-size:13px}
 .u-note{margin-top:14px;font-size:11px;color:var(--ink3);line-height:1.7}
+
+/* ── 站点监控面板 ── */
+.modal-wide{width:860px}
+.mon-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;
+  margin-bottom:14px}
+.mon-card{border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.mon-v{font-size:22px;font-weight:700;color:var(--ink)}
+.mon-l{font-size:12px;color:var(--ink3);margin-top:2px}
+.mon-s{font-size:11px;color:var(--ink3);margin-top:4px}
+.mon-tabs{margin-bottom:10px;align-items:center}
+.mon-wrap{max-height:55vh;overflow:auto;border:1px solid var(--line);
+  border-radius:10px;padding:0 10px}
+.mon-table{margin-bottom:0;font-size:12px;white-space:nowrap}
+.mon-table td{max-width:220px;overflow:hidden;text-overflow:ellipsis}
+.mon-fail{color:#d6453d;font-weight:600}
+.mon-err td{color:#d6453d;font-size:11px;border-bottom:1px dashed var(--line)}
+

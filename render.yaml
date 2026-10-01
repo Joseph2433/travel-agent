@@ -19,6 +19,10 @@ services:
         sync: false
       - key: LLM_MODEL         # 如 deepseek-chat
         sync: false
+      - key: LLM_CHANNEL       # 可选，多渠道时填渠道名（如 xpeach）
+        sync: false
+      - key: LLM_CHANNELS      # 可选，追加渠道 JSON：[{"name":"xpeach","key":"...","base_url":"https://xpeach.codes/v1","model":"deepseek-flash","format":"responses"}]
+        sync: false
       - key: BOCHA_API_KEY     # 可选，博查搜索
         sync: false
       - key: XHS_API_BASE      # 可选，云端模式填 https://mcp.aredink.com/mcp
@@ -27,3 +31,7 @@ services:
         sync: false
       - key: CORS_ORIGINS      # 填你的 Pages 域名，如 https://<user>.github.io
         sync: false
+      - key: AUTH_SEED         # 可选，初始账号 "admin:密码"。配后管理员登录站点可看「监控」面板
+        sync: false
+      # 监控说明：日志写 backend/data/monitor/*.jsonl（免费档重启即清空），
+      # 同时镜像到 stdout —— Render 控制台 → Logs 搜 "monitor:" 可持久回看。

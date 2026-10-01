@@ -81,6 +81,40 @@ def geocode(address: str):
         return None
 
 
+def _norm_city(name: str) -> str:
+    """去掉行政区后缀：无锡市→无锡、北京市→北京、香港特别行政区→香港。"""
+    for suf in ("特别行政区", "自治州", "地区", "盟", "市"):
+        if name.endswith(suf):
+            return name[:-len(suf)]
+    return name
+
+
+def regeo(lat, lng):
+    """高德逆地理编码：经纬度 -> 真实所属城市。
+    返回 {city, province, district, formatted} 或 None。
+    addressComponent 空字段为 []；直辖市 city 为空时回退用 province。"""
+    if not amap_available():
+        return None
+    try:
+        d = _amap_get("/v3/geocode/regeo", location=f"{lng},{lat}",
+                      extensions="base")
+        rg = d.get("regeocode") or {}
+        comp = rg.get("addressComponent") or {}
+        prov = comp.get("province") or ""
+        city = comp.get("city") or prov
+        if not isinstance(city, str) or not city:
+            return None
+        return {
+            "city": _norm_city(city),
+            "province": prov if isinstance(prov, str) else "",
+            "district": comp.get("district") or "",
+            "formatted": rg.get("formatted_address") or "",
+            "src": "amap",
+        }
+    except Exception:
+        return None
+
+
 def driving_route(o_lng, o_lat, d_lng, d_lat):
     """驾车路径规划：返回 {km, hours, tolls}。"""
     if not amap_available():

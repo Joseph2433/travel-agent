@@ -24,8 +24,9 @@ def load_cities():
 # ----------------------------------------------------------- 工具实现 ----
 
 def resolve_origin(ctx, lat=None, lng=None, city=None, client_ip=None):
-    """定位解析：指定城市 > 浏览器坐标 > 高德IP定位 > 默认上海。
-    城市不在知识库时：用前端传来的坐标，或高德地理编码兜底。"""
+    """定位解析：指定城市 > 浏览器坐标（高德逆地理，失败则吸附最近枢纽）
+    > 高德IP定位 > 默认上海。城市不在知识库时：用前端传来的坐标，
+    或高德地理编码兜底。"""
     cities = load_cities()
     if city:
         for c in cities:
@@ -42,6 +43,11 @@ def resolve_origin(ctx, lat=None, lng=None, city=None, client_ip=None):
                     "lat": g["lat"], "lng": g["lng"], "src": "amap",
                     "note": f"高德地理编码：{g.get('formatted','')}"}
     if lat is not None and lng is not None:
+        rg = apis.regeo(lat, lng)
+        if rg:
+            return {"name": rg["city"], "province": rg["province"],
+                    "lat": float(lat), "lng": float(lng), "src": "gps",
+                    "note": f"GPS定位 · {rg['district'] or rg['city']}（高德逆地理）"}
         near = min(cities, key=lambda c: geo.haversine_km(lat, lng, c["lat"], c["lng"]))
         return {"name": near["name"], "province": near["province"],
                 "lat": float(lat), "lng": float(lng), "src": "gps",
@@ -51,9 +57,11 @@ def resolve_origin(ctx, lat=None, lng=None, city=None, client_ip=None):
         return {"name": ip_loc.get("city") or "未知", "province": ip_loc.get("province", ""),
                 "lat": ip_loc["lat"], "lng": ip_loc["lng"], "src": "amap-ip",
                 "note": "高德IP定位（精度到城市级）"}
-    sh = next(c for c in cities if c["name"] == "上海")
+    sh = (next((c for c in cities if c["name"] == "上海"), None)
+          or (cities[0] if cities else None)
+          or {"name": "上海", "province": "上海", "lat": 31.2304, "lng": 121.4737})
     return {"name": sh["name"], "province": sh["province"], "lat": sh["lat"], "lng": sh["lng"],
-            "src": "default", "note": "定位不可用，默认以上海为出发地"}
+            "src": "default", "note": f"定位不可用，默认以{sh['name']}为出发地"}
 
 
 def pool_profile(name, province="", lat=None, lng=None):
@@ -65,6 +73,26 @@ def pool_profile(name, province="", lat=None, lng=None):
             "hotelPerNight": 280, "foodPerDay": 110, "localPerDay": 40,
             "attractions": [], "foods": [], "tags": [], "bestMonths": [],
             "hsRail": True, "airport": True, "tips": []}
+
+
+def get_city(name):
+    """城市画像统一入口：知识库 → 全国地级市池（坐标+省份）→ 高德地理编码。
+    找不到返回 None；任何地方都不应再直接遍历 load_cities() 假定在库。"""
+    name = (name or "").strip().rstrip("市")
+    if not name:
+        return None
+    c = next((x for x in load_cities() if x["name"] == name), None)
+    if c:
+        return c
+    row = next((r for r in (apis.all_prefecture_cities() or [])
+                if r.get("name") == name), None)
+    if row:
+        return pool_profile(name, row.get("province", ""),
+                            row.get("lat"), row.get("lng"))
+    g = apis.geocode(name)
+    if g and g.get("lat") is not None:
+        return pool_profile(name, g.get("city") or "", g["lat"], g["lng"])
+    return None
 
 
 def scan_destinations(ctx, origin, budget, days, transport, prefs,
@@ -298,10 +326,12 @@ _WINTER_MARK = ("冰雪大世界", "雪博会", "冰雪嘉年华")
 
 def fetch_intel(ctx, city_name, date=None):
     """目的地情报搜索：高德POI + 天气(+指定日期的逐日预报) + 网页攻略 + 本地知识库。"""
-    c = next(x for x in load_cities() if x["name"] == city_name)
-    intel = {"city": c, "sources": ["本地知识库"], "pois_scenic": None,
-             "pois_food": None, "weather": None, "web": None,
-             "scenic_qunar": None}
+    c = get_city(city_name) or pool_profile(city_name)
+    in_kb = any(x["name"] == c["name"] for x in load_cities())
+    intel = {"city": c,
+             "sources": ["本地知识库"] if in_kb else [],
+             "pois_scenic": None, "pois_food": None, "weather": None,
+             "web": None, "scenic_qunar": None}
     w = apis.weather_live(c["name"])
     if w:
         intel["weather"] = w; intel["sources"].append("高德天气")
@@ -328,12 +358,57 @@ def fetch_intel(ctx, city_name, date=None):
     return intel
 
 
+def _poi_attractions(intel, cap):
+    """非知识库城市：把实时POI/去哪儿在售景点合成 judge 用的景点素材
+    （与知识库 attraction 同构：n/desc/ticket/hours/must）。"""
+    out, seen = [], set()
+    for s in intel.get("scenic_qunar") or []:
+        n = (s.get("name") or "").strip()
+        if n and n not in seen:
+            seen.add(n)
+            out.append({"n": n,
+                        "desc": (s.get("intro") or "").strip()[:40]
+                                or f"去哪儿在售景区·评分{s.get('score') or '—'}",
+                        "ticket": s.get("ticket") or 0, "hours": 3,
+                        "must": min(5.0, float(s.get("score") or 3.5))})
+    for p in intel.get("pois_scenic") or []:
+        n = (p.get("name") or "").strip()
+        if n and n not in seen:
+            seen.add(n)
+            try:
+                must = min(5.0, float(p.get("rating") or 3))
+            except (TypeError, ValueError):
+                must = 3.0
+            out.append({"n": n,
+                        "desc": f"高德热门POI·评分{p.get('rating') or '—'}",
+                        "ticket": 0, "hours": 3, "must": must})
+    return out[:cap]
+
+
+def _poi_foods(intel):
+    """非知识库城市：高德美食POI → 与知识库 food 同构的 {n,d,p}。"""
+    out = []
+    for p in (intel.get("pois_food") or [])[:5]:
+        if not p.get("name"):
+            continue
+        try:
+            cost = int(float(p.get("cost") or 60))
+        except (TypeError, ValueError):
+            cost = 60
+        out.append({"n": p["name"],
+                    "d": f"高德热门POI·评分{p.get('rating') or '—'}",
+                    "p": cost})
+    return out
+
+
 def judge_intel(ctx, intel, days, prefs, date=None):
     """对搜到的情报做判断：剔除不合时令/低价值项，按天数取舍，输出核心体验清单。
     date: 出发日 YYYY-MM-DD → 生成假期/预售/逐日天气提示。"""
     c, month = intel["city"], datetime.now().month
     kept, dropped, notes = [], [], []
-    for a in c["attractions"]:
+    cap = max(3, round(days * 2.5))
+    atts = c["attractions"] or _poi_attractions(intel, cap)
+    for a in atts:
         if any(m in a["n"] for m in _WINTER_MARK) and month not in (12, 1, 2):
             dropped.append({"name": a["n"], "reason": "冬季限定，当前未开放"})
             continue
@@ -343,7 +418,6 @@ def judge_intel(ctx, intel, days, prefs, date=None):
         kept.append(a)
     # 高权重优先，容量=每天约2.5个景点
     kept.sort(key=lambda a: -a["must"])
-    cap = max(3, round(days * 2.5))
     overflow = kept[cap:]
     kept = kept[:cap]
     for a in overflow:
@@ -352,7 +426,8 @@ def judge_intel(ctx, intel, days, prefs, date=None):
     notes = date_notes(meta, trip_forecast(intel, meta))
     notes += _base_notes(intel)
     return {"kept": kept, "dropped": dropped, "notes": notes,
-            "foods": c["foods"][:5], "tips": c["tips"],
+            "foods": c["foods"][:5] or _poi_foods(intel),
+            "tips": c["tips"],
             "qunar_scenic": intel.get("scenic_qunar") or []}
 
 
@@ -372,10 +447,11 @@ def _base_notes(intel):
                      key=lambda s: -(s.get("sales") or 0))[:3]
         notes.append("去哪儿在售景点（真实票价）：" + "、".join(
             f"{s['name']}¥{s['ticket']:g}" for s in top))
-    if month in c["bestMonths"]:
-        notes.append(f"{month}月正值{c['name']}佳季")
-    else:
-        notes.append(f"{month}月非{c['name']}最佳季节（佳季：{'/'.join(map(str,c['bestMonths']))}月）")
+    if c["bestMonths"]:
+        if month in c["bestMonths"]:
+            notes.append(f"{month}月正值{c['name']}佳季")
+        else:
+            notes.append(f"{month}月非{c['name']}最佳季节（佳季：{'/'.join(map(str,c['bestMonths']))}月）")
     return notes
 
 
@@ -412,7 +488,8 @@ def apply_llm_judge(intel, days, prefs, llm_out):
              if isinstance(x, str) and x.strip()][:4]
     notes += _base_notes(intel)
     return {"kept": kept, "dropped": dropped, "notes": notes,
-            "foods": c["foods"][:5], "tips": c["tips"],
+            "foods": c["foods"][:5] or _poi_foods(intel),
+            "tips": c["tips"],
             "qunar_scenic": intel.get("scenic_qunar") or []}
 
 
@@ -441,7 +518,7 @@ def _real_rail(origin_name, dest_name, dep_date=None, ret_date=None):
 def compose_plans(ctx, origin, dest_name, budget, days, transport, prefs,
                   judged, date=None):
     """编排 3-5 套差异化行程方案。date: 出发日 YYYY-MM-DD（可选）。"""
-    c = next(x for x in load_cities() if x["name"] == dest_name)
+    c = get_city(dest_name) or pool_profile(dest_name)
     km = geo.haversine_km(origin["lat"], origin["lng"], c["lat"], c["lng"])
 
     trans = geo.estimate_transport(km, transport, c)

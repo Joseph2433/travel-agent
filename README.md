@@ -76,6 +76,8 @@ cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
 | `LLM_API_KEY` | 大模型 key（OpenAI 兼容协议，需支持 function calling） | 规则引擎决策 |
 | `LLM_BASE_URL` | 默认 `https://api.moonshot.cn/v1` | — |
 | `LLM_MODEL` | 默认 `kimi-k2-0905-preview` | — |
+| `LLM_CHANNEL` | 多渠道切换：选择生效渠道名（缺省 `default`，渠道没配 key 自动回退 default） | `default` |
+| `LLM_CHANNELS` | 追加渠道（JSON 数组）：`[{"name":"xpeach","key":"sk-...","base_url":"https://xpeach.codes/v1","model":"gpt-5.2","format":"responses"}]`；`format` 支持 `chat`（默认）/ `responses`（/responses 新协议），`key`/`base_url`/`model` 缺省继承 default | 仅 default |
 | `XHS_API_BASE` | 小红书笔记源地址，二选一：本地 [xiaohongshu-mcp](https://github.com/xpzouying/xiaohongshu-mcp) `http://localhost:18060`（REST 层）；或 x-mcp 插件云端 `https://mcp.aredink.com/mcp`（以 `/mcp` 结尾自动走 MCP Streamable HTTP 协议）。启用 `search_xhs_notes` 工具让模型查真实攻略笔记 | 跳过小红书源 |
 | `XHS_API_TOKEN` | 本地服务设了 `AUTH_TOKEN` 时填；x-mcp 插件版填 aredink 账号的 API Token（同时以 `X-API-Key` 与 `Authorization: Bearer` 发送） | — |
 | `BOCHA_API_KEY` | [博查AI搜索](https://open.bochaai.com/) key：攻略摘要主源（中文质量好、索引含小红书），有免费额度 | 回退 Bing/DDG 抓取 |
@@ -127,9 +129,28 @@ cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
 | GET | /api/auth/me | 当前登录态/鉴权是否启用 |
 | POST | /api/auth/logout | 注销 |
 | GET/POST/DELETE | /api/auth/users | 管理员：列账号/开号/删号 |
+| GET | /api/monitor/overview | 管理员：监控概览（今日请求/独立IP/生成数、近7天趋势、Top IP） |
+| GET | /api/monitor/logs?kind=gen\|access&n=200 | 管理员：生成/访问日志明细 |
 
 注意云端文件系统是临时的：Render 上管理面板添加的账号在重部署后丢失，
 长期账号写进 `AUTH_SEED`（可放多个，追加即可）。
+
+### 站点监控
+
+所有 `/api/*` 请求和首页访问自动落盘为 JSONL，每次 Agent 生成（范围预览/
+目的地推荐/出游方案，含 SSE 流式）额外记录一条生成日志：时间、真实 IP
+（自动读 `X-Forwarded-For`，反代后面也能拿到）、登录用户、请求参数、
+结果摘要、耗时、成败。日志在 `backend/data/monitor/`（按天分文件，已
+gitignore）。
+
+查看：导航栏「监控」按钮打开面板（统计卡片 + 生成记录/访问日志双 Tab）。
+因日志含访客 IP，接口有权限门槛——启用账号体系时仅管理员可见；未启用
+账号时仅本机环回地址可访问（公网部署请务必在 Render 配置 `AUTH_SEED`
+创建管理员账号后登录查看）。
+
+Render 免费档无持久磁盘，`backend/data/` 随重部署清空；每条日志同时镜像
+到 stdout，Render 控制台 → Logs 搜 `monitor:` 可回看（本地可用
+`MONITOR_STDOUT=0` 关闭镜像）。
 
 ## 前端
 
@@ -146,7 +167,8 @@ GitHub Pages 只能跑静态文件，FastAPI 后端（SSE 流式 + 长耗时 Age
 **① 后端 → Render（免费档，推荐）**
 1. [render.com](https://render.com) → New → **Blueprint** → 选本仓库（`render.yaml` 已写好）
 2. 按提示填环境变量：`AMAP_KEY` / `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`
-   （可选 `BOCHA_API_KEY`；小红书云端模式填 `XHS_API_BASE=https://mcp.aredink.com/mcp`
+   （走 xpeach 渠道则改填 `LLM_CHANNEL=xpeach` + `LLM_CHANNELS=[{"name":"xpeach",...,"format":"responses"}]`；
+   可选 `BOCHA_API_KEY`；小红书云端模式填 `XHS_API_BASE=https://mcp.aredink.com/mcp`
    + `XHS_API_TOKEN`）；`CORS_ORIGINS` 填 `https://<你的用户名>.github.io`
 3. 部署完记下后端地址，如 `https://travel-agent-xxxx.onrender.com`
    - 也可选 Railway / Fly.io：根目录已附 `Procfile`，环境变量同上

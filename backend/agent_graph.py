@@ -75,10 +75,16 @@ _plan_agent_g = None
 
 def _chat_model():
     from langchain_openai import ChatOpenAI
-    return ChatOpenAI(model=llm.LLM_MODEL, api_key=llm.LLM_API_KEY,
-                    base_url=llm.LLM_BASE_URL.rstrip("/"),
-                    timeout=llm._TIMEOUT, max_tokens=llm._MAX_TOKENS,
-                    temperature=0.3)
+    ch = llm.active()
+    kw = {}
+    if ch["api_format"] == "responses":          # /responses 协议渠道
+        kw["use_responses_api"] = True
+    if ch["temperature"] is not None:
+        kw["temperature"] = ch["temperature"]
+    return ChatOpenAI(model=ch["model"], api_key=ch["api_key"],
+                      base_url=ch["base_url"].rstrip("/"),
+                      timeout=llm._TIMEOUT, max_tokens=llm._MAX_TOKENS,
+                      **kw)
 
 
 def _rec_agent():
@@ -174,6 +180,17 @@ def _msg_trace(msgs):
             if isinstance(rc, str) and rc.strip():
                 steps.append(_t("think", "模型推理",
                                 " ".join(rc.split())[:110] + "…"))
+            content = getattr(m, "content", None)
+            if isinstance(content, list):       # Responses API：reasoning 内容块
+                rt = " ".join(
+                    (s.get("text") or "") if isinstance(s, dict) else str(s)
+                    for blk in content
+                    if isinstance(blk, dict) and blk.get("type") == "reasoning"
+                    for s in (blk.get("summary") or
+                              [blk.get("reasoning") or ""]))
+                if rt.strip():
+                    steps.append(_t("think", "模型推理",
+                                    " ".join(rt.split())[:110] + "…"))
             for tc in getattr(m, "tool_calls", None) or []:
                 args = json.dumps(tc.get("args") or {}, ensure_ascii=False)
                 steps.append(_t("tool", f"调用工具 {tc['name']}", args[:80]))
@@ -211,27 +228,76 @@ def _writer():
         return None
 
 
+def _has_submit(msgs):
+    """消息流里是否出现过 submit_result 工具调用。"""
+    return any(getattr(m, "type", "") == "ai"
+               and any(tc.get("name") == "submit_result"
+                       for tc in (getattr(m, "tool_calls", None) or []))
+               for m in msgs)
+
+
+# 瞬时故障特征：连接失败/超时/限流/5xx——中转站抖动属此类，值得退避重试
+_RETRY_HINTS = ("connection", "timed out", "timeout", "429", "500", "502",
+                "503", "504", "rate limit", "unavailable", "overloaded",
+                "econnreset", "temporarily")
+
+
+def _retryable(e):
+    s = f"{type(e).__name__} {e}".lower()
+    return any(k in s for k in _RETRY_HINTS)
+
+
 def _run_react(agent, user_msg):
     """流式执行 ReAct 子图：每出现一条新消息（思考/工具调用/观察）立刻经
-    custom writer 推给 SSE 通道。返回 (messages, 异常或None, 已推送的steps)。"""
+    custom writer 推给 SSE 通道。
+    防抖：瞬时故障指数退避重试（1s/2s/4s，共至多4次）；
+    模型跑完没调 submit_result 收尾时，带完整上下文补一条提醒续跑一次。
+    返回 (messages, 异常或None, 已推送的steps)。"""
     w = _writer()
     msgs, steps = [], []
-    try:
-        for chunk in agent.stream({"messages": [("user", user_msg)]},
-                                  config={"recursion_limit": 30},
-                                  stream_mode="updates"):
-            for _node, upd in chunk.items():
-                if not isinstance(upd, dict):
-                    continue
-                for m in upd.get("messages") or []:
-                    msgs.append(m)
-                    for st in _msg_trace([m]):
-                        steps.append(st)
-                        if w:
-                            w({"type": "step", **st})
-        return msgs, None, steps
-    except Exception as e:
-        return msgs, e, steps
+    history = [("user", user_msg)]
+    nudged = False
+    for attempt in range(4):
+        new = []
+        try:
+            for chunk in agent.stream({"messages": history},
+                                      config={"recursion_limit": 30},
+                                      stream_mode="updates"):
+                for _node, upd in chunk.items():
+                    if not isinstance(upd, dict):
+                        continue
+                    for m in upd.get("messages") or []:
+                        msgs.append(m)
+                        new.append(m)
+                        for st in _msg_trace([m]):
+                            steps.append(st)
+                            if w:
+                                w({"type": "step", **st})
+        except Exception as e:
+            if _retryable(e) and attempt < 3:
+                delay = min(2 ** attempt, 4)
+                st = _t("brain", "调用抖动，退避重试",
+                        f"{type(e).__name__}：{str(e)[:50]}，"
+                        f"{delay}s 后第 {attempt + 2} 次尝试")
+                steps.append(st)
+                if w:
+                    w({"type": "step", **st})
+                time.sleep(delay)
+                continue
+            return msgs, e, steps
+        if not nudged and not _has_submit(msgs):
+            nudged = True
+            st = _t("brain", "未提交结论，提醒模型续跑",
+                    "缺少 submit_result 调用")
+            steps.append(st)
+            if w:
+                w({"type": "step", **st})
+            history = history + new + [(
+                "user", "你还没有调用 submit_result 提交结论。请立即调用 "
+                "submit_result，payload 为符合输出格式的完整 JSON 对象。")]
+            continue
+        break
+    return msgs, None, steps
 
 
 def _extract_structured(msgs, cls):
@@ -487,10 +553,9 @@ def n_agent_plan(s: S):
         why = (f"调用失败：{str(err)[:60]}" if err
                else f"输出不合法（{ext_err}）")
         steps.append(_t("judge", "LLM 编排", f"{why}，转规则引擎"))
-        # 原地降级到规则流水线（仅知识库城市有兜底素材）
-        kb = next((x for x in tools.load_cities()
-                   if x["name"] == req["dest"].rstrip("市")), None)
-        if kb is None:
+        # 原地降级到规则流水线（非知识库城市用合成画像 + 实时POI 素材）
+        c = tools.get_city(req["dest"])
+        if c is None:
             return {"intel": {"sources": [], "weather": None, "web": None,
                               "city": {"name": req["dest"], "tips": []}},
                     "judged": {"notes": ["该目的地不在知识库，且模型编排失败"],
@@ -507,7 +572,7 @@ def n_agent_plan(s: S):
                                      req.get("prefs") or [], judged,
                                      date=req.get("date"))
         return {"intel": intel, "judged": judged, "result": result,
-                "guide": tools.build_guide(kb, intel, judged,
+                "guide": tools.build_guide(c, intel, judged,
                                            tool_data=tool_data,
                                            transport=result.get("transport")),
                 "judge_engine": "rule-fallback", "tool_data": tool_data,
@@ -525,8 +590,7 @@ def n_assemble(s: S):
     req, origin = s["req"], s["origin"]
     tool_data = s.get("tool_data") or {}
     dest_name = req["dest"].rstrip("市")
-    kb = next((x for x in tools.load_cities() if x["name"] == dest_name), None)
-    c = kb or _pseudo_city(dest_name)
+    c = tools.get_city(dest_name) or _pseudo_city(dest_name)   # 知识库→池→地理编码→中性档
 
     transport, km, mode = _resolve_transport(origin, c, req, tool_data)
     att_map = {a["n"]: a for a in c["attractions"]}
@@ -571,7 +635,7 @@ def n_assemble(s: S):
             "over_hint": f"约超¥{b['total'] - req['budget']}，建议降低住宿或餐饮档位" if over else "",
         })
 
-    if len(plans) < 3 and kb:                    # 知识库城市 → 规则兜底
+    if len(plans) < 3:                           # 方案不足 → 规则兜底（非知识库城市也可）
         intel = tools.fetch_intel(None, req["dest"], date=req.get("date"))
         judged = tools.judge_intel(None, intel, req["days"],
                                    req.get("prefs") or [], date=req.get("date"))
@@ -580,7 +644,7 @@ def n_assemble(s: S):
                                      req.get("prefs") or [], judged,
                                      date=req.get("date"))
         return {"intel": intel, "judged": judged, "result": result,
-                "guide": tools.build_guide(kb, intel, judged,
+                "guide": tools.build_guide(c, intel, judged,
                                            tool_data=tool_data,
                                            transport=result.get("transport")),
                 "judge_engine": "rule-fallback",
@@ -684,14 +748,11 @@ def _resolve_transport(origin, c, req, tool_data):
 
 
 def _pseudo_city(name):
-    """非知识库目的地：地理编码定位 + 中性消费档，景点/美食完全交给 POI。"""
-    g = apis.geocode(name) or {}
-    return {"name": name, "province": g.get("city") or "",
-            "lat": g.get("lat") or 35.0, "lng": g.get("lng") or 110.0,
-            "hotelPerNight": 300, "foodPerDay": 120, "localPerDay": 40,
-            "attractions": [], "foods": [], "tags": [], "bestMonths": [],
-            "hsRail": True, "airport": True,
-            "tips": ["该目的地不在本地知识库，行程基于高德POI与网络攻略实时编排"]}
+    """非知识库目的地：get_city 合成画像（地级市池/地理编码）+ 提示语。"""
+    c = tools.get_city(name) or tools.pool_profile(name)
+    if not c.get("tips"):
+        c = dict(c, tips=["该目的地不在本地知识库，行程基于高德POI与网络攻略实时编排"])
+    return c
 
 
 def _poi_map(tool_data):

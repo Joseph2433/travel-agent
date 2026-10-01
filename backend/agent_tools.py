@@ -200,9 +200,9 @@ def query_trains(from_city: str, to_city: str,
 def estimate_transport(from_city: str, to_city: str, mode: str = "auto"):
     """估算两城市间交通：直线km、推荐方式、单程耗时h、单程费用、可行性。
     mode: auto|train|flight|drive。"""
-    a, b = _city(from_city), _city(to_city)
+    a, b = T.get_city(from_city), T.get_city(to_city)
     if not a or not b:
-        return _j({"error": "城市不在知识库"})
+        return _j({"error": "城市无法定位（不在知识库且地理编码失败）"})
     km = geo.haversine_km(a["lat"], a["lng"], b["lat"], b["lng"])
     est = geo.estimate_transport(km, mode or "auto", b)
     return _j({"km": km, **est})
@@ -215,9 +215,9 @@ def calc_budget(city: str, days: int, transport_one_way: float,
     """计算行程预算拆解（单人）：往返交通×2 + 住宿(晚数=天数-1) + 餐饮 + 门票 + 市内。
     hotel_factor/food_factor 调节档位（0.8穷游 1.0标准 1.3+舒适），tickets 为门票合计
     ——优先把 get_city_intel 返回的 scenic_qunar 真实票价相加传入，不要估算。"""
-    c = _city(city)
+    c = T.get_city(city)
     if not c:
-        return _j({"error": f"未知城市「{city}」"})
+        return _j({"error": f"城市「{city}」无法定位"})
     return _j(geo.trip_budget(c, days, transport_one_way,
                               hotel_factor=hotel_factor, food_factor=food_factor,
                               attraction_ticket_sum=tickets))

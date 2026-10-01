@@ -5,6 +5,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
 import envload                     # noqa: F401  必须先于 apis/llm 加载 .env
+import time
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -15,6 +16,7 @@ import agent
 import apis
 import auth
 import llm
+import monitor
 import tools
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -49,6 +51,27 @@ app.add_middleware(
     allow_origins=[o.strip() for o in
                    os.getenv("CORS_ORIGINS", "*").split(",")],
     allow_methods=["*"], allow_headers=["*"])
+
+
+# 监控中间件：注册在 CORS 之后 → 最外层，能看到所有请求与登录态。
+# 记录 /api/* 全部请求 + 首页 GET（页面访问）；其余静态资源不记（纯噪音）。
+@app.middleware("http")
+async def _monitor(request: Request, call_next):
+    p = request.url.path
+    watch = p.startswith("/api/") or (
+        request.method == "GET" and p in ("/", "/index.html"))
+    if not watch or request.method == "OPTIONS":
+        return await call_next(request)
+    t0 = time.time()
+    try:
+        resp = await call_next(request)
+        status = resp.status_code
+        return resp
+    except Exception:
+        status = 500
+        raise
+    finally:
+        monitor.log_access(request, status, (time.time() - t0) * 1000)
 
 
 # ---- 账号：登录/会话/管理员开号（无注册入口） ----
@@ -177,7 +200,10 @@ def geo_cities(province: str):
     lst = apis.district_cities(province)
     if not lst:
         prov = province.strip().rstrip("省市自治区壮族回族维吾尔") or province
-        lst = [{"name": c["name"], "lat": c["lat"], "lng": c["lng"]}
+        lst = [{"name": r["name"], "lat": r.get("lat"), "lng": r.get("lng")}
+               for r in (apis.all_prefecture_cities() or [])
+               if (r.get("province") or "").startswith(prov[:2])] or \
+              [{"name": c["name"], "lat": c["lat"], "lng": c["lng"]}
                for c in tools.load_cities()
                if c["province"].startswith(prov[:2])]
         if not lst:
@@ -194,7 +220,7 @@ class LocateReq(BaseModel):
 @app.post("/api/locate")
 def locate(req: LocateReq, request: Request):
     agent = TravelAgent()
-    ip = request.client.host if request.client else None
+    ip = monitor.client_ip(request)
     origin = tools.resolve_origin(agent, lat=req.lat, lng=req.lng,
                                   city=req.city, client_ip=ip)
     return origin
@@ -204,66 +230,123 @@ def locate(req: LocateReq, request: Request):
 def scope(req: RecommendReq, request: Request):
     """可达范围预览：按出行方式+天数+预算扫描全国地级市池，
     返回各省份的可行城市数/最快单程耗时/最低单程价，供前端圈范围。"""
-    ip = request.client.host if request.client else None
-    origin = tools.resolve_origin(None, lat=req.lat, lng=req.lng,
-                                  city=req.city, client_ip=ip)
-    scanned = tools.scan_destinations(None, origin, req.budget, req.days,
-                                      req.transport or "auto",
-                                      req.prefs or [])
-    by_prov = {}
-    for s in scanned:
-        if not s.get("feasible"):
-            continue
-        p = by_prov.setdefault(s["province"],
-                               {"name": s["province"], "n": 0,
-                                "min_hours": 99.0, "min_cost": 99999,
-                                "n_fit": 0, "kb": []})
-        p["n"] += 1
-        h = s["transport_est"].get("hours") or 99.0
-        p["min_hours"] = round(min(p["min_hours"], h), 1)
-        p["min_cost"] = min(p["min_cost"], s["transport_est"]["cost"])
-        if s["fits_budget"]:
-            p["n_fit"] += 1
-        if s.get("in_kb"):
-            p["kb"].append(s["city"])
-    provs = sorted(by_prov.values(), key=lambda x: x["min_hours"])
-    return {"origin": {"name": origin["name"], "lat": origin["lat"],
-                       "lng": origin["lng"]},
-            "total": sum(p["n"] for p in provs), "provinces": provs}
+    t0 = time.time()
+    ip = monitor.client_ip(request)
+    try:
+        origin = tools.resolve_origin(None, lat=req.lat, lng=req.lng,
+                                      city=req.city, client_ip=ip)
+        scanned = tools.scan_destinations(None, origin, req.budget, req.days,
+                                          req.transport or "auto",
+                                          req.prefs or [])
+        by_prov = {}
+        for s in scanned:
+            if not s.get("feasible"):
+                continue
+            p = by_prov.setdefault(s["province"],
+                                   {"name": s["province"], "n": 0,
+                                    "min_hours": 99.0, "min_cost": 99999,
+                                    "n_fit": 0, "kb": []})
+            p["n"] += 1
+            h = s["transport_est"].get("hours") or 99.0
+            p["min_hours"] = round(min(p["min_hours"], h), 1)
+            p["min_cost"] = min(p["min_cost"], s["transport_est"]["cost"])
+            if s["fits_budget"]:
+                p["n_fit"] += 1
+            if s.get("in_kb"):
+                p["kb"].append(s["city"])
+        provs = sorted(by_prov.values(), key=lambda x: x["min_hours"])
+        out = {"origin": {"name": origin["name"], "lat": origin["lat"],
+                          "lng": origin["lng"]},
+               "total": sum(p["n"] for p in provs), "provinces": provs}
+        monitor.log_gen(request, "scope", req.model_dump(),
+                        (time.time() - t0) * 1000, ok=True, data=out)
+        return out
+    except Exception as e:
+        monitor.log_gen(request, "scope", req.model_dump(),
+                        (time.time() - t0) * 1000, ok=False, error=e)
+        raise
 
 
 @app.post("/api/agent/destinations")
 def destinations(req: RecommendReq, request: Request):
     agent = TravelAgent()
-    ip = request.client.host if request.client else None
-    return agent.run_recommend(req.model_dump(), client_ip=ip)
+    ip = monitor.client_ip(request)
+    t0 = time.time()
+    try:
+        out = agent.run_recommend(req.model_dump(), client_ip=ip)
+        monitor.log_gen(request, "recommend", req.model_dump(),
+                        (time.time() - t0) * 1000, ok=True, data=out)
+        return out
+    except Exception as e:
+        monitor.log_gen(request, "recommend", req.model_dump(),
+                        (time.time() - t0) * 1000, ok=False, error=e)
+        raise
 
 
 @app.post("/api/agent/plans")
 def plans(req: PlanReq, request: Request):
     agent = TravelAgent()
-    ip = request.client.host if request.client else None
-    return agent.run_plan(req.model_dump(), client_ip=ip)
+    ip = monitor.client_ip(request)
+    t0 = time.time()
+    try:
+        out = agent.run_plan(req.model_dump(), client_ip=ip)
+        monitor.log_gen(request, "plan", req.model_dump(),
+                        (time.time() - t0) * 1000, ok=True, data=out)
+        return out
+    except Exception as e:
+        monitor.log_gen(request, "plan", req.model_dump(),
+                        (time.time() - t0) * 1000, ok=False, error=e)
+        raise
 
 
 # ---- SSE 流式端点：逐步推送 Agent 思考/工具调用，done 事件携带完整结果 ----
 
 @app.post("/api/agent/destinations/stream")
 def destinations_stream(req: RecommendReq, request: Request):
-    ip = request.client.host if request.client else None
+    ip = monitor.client_ip(request)
+    body = req.model_dump()
     return StreamingResponse(
-        agent.stream_recommend(req.model_dump(), client_ip=ip),
+        monitor.wrap_stream(request, "recommend", body,
+                            agent.stream_recommend(body, client_ip=ip)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/agent/plans/stream")
 def plans_stream(req: PlanReq, request: Request):
-    ip = request.client.host if request.client else None
+    ip = monitor.client_ip(request)
+    body = req.model_dump()
     return StreamingResponse(
-        agent.stream_plan(req.model_dump(), client_ip=ip),
+        monitor.wrap_stream(request, "plan", body,
+                            agent.stream_plan(body, client_ip=ip)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ---- 监控查询（含访客 IP/UA，属于敏感信息） ----
+# 启用账号体系 → 仅管理员；未启用（本地开发）→ 仅本机环回地址可访问，
+# 避免公网部署且没配账号时任何人都能拉到全部访客 IP。
+
+def _require_monitor(request):
+    if auth.enabled():
+        return _require_admin(request)
+    return monitor.client_ip(request) in ("127.0.0.1", "::1")
+
+
+@app.get("/api/monitor/overview")
+def monitor_overview(request: Request):
+    if not _require_monitor(request):
+        return JSONResponse({"error": "需要管理员权限"}, status_code=403)
+    return monitor.overview()
+
+
+@app.get("/api/monitor/logs")
+def monitor_logs(request: Request, kind: str = "gen", n: int = 200):
+    if not _require_monitor(request):
+        return JSONResponse({"error": "需要管理员权限"}, status_code=403)
+    if kind not in ("gen", "access"):
+        kind = "gen"
+    return {"logs": monitor.recent(kind, min(max(n, 1), 1000))}
 
 
 @app.exception_handler(Exception)

@@ -7,13 +7,13 @@ const $$ = s => [...document.querySelectorAll(s)];
    · 线上 Pages → 取 config.js 的 window.API_BASE；
    · 任何环境都可用 ?api=https://xxx 显式覆盖（写入 localStorage 持久化），
      ?api=local 清除覆盖还原默认。 */
+const IS_LOCAL = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
 const API_BASE = (() => {
   const q = new URLSearchParams(location.search).get("api");
   if (q === "local") localStorage.removeItem("api_base");
   else if (q) localStorage.setItem("api_base", q.replace(/\/+$/, ""));
   const saved = localStorage.getItem("api_base") || "";
-  const isLocal = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
-  return (saved || (isLocal ? "" : window.API_BASE || "")).replace(/\/+$/, "");
+  return (saved || (IS_LOCAL ? "" : window.API_BASE || "")).replace(/\/+$/, "");
 })();
 
 /* ── 账号鉴权：token 存 localStorage；401 → 弹登录门 ── */
@@ -39,6 +39,7 @@ function applyMe(){
   $("#userChip").classList.remove("hidden");
   $("#userName").textContent = "@" + ME.user;
   $("#btnUsers").classList.toggle("hidden", ME.role !== "admin");
+  $("#btnMonitor").classList.toggle("hidden", ME.role !== "admin");
 }
 
 async function doLogin(){
@@ -96,6 +97,99 @@ async function addUser(){
   openAdmin();
 }
 
+/* ── 站点监控（管理员）：概览统计 + 生成/访问日志 ── */
+let MON_TAB = "gen";
+const MON_KIND = {recommend: "目的地推荐", plan: "出游方案", scope: "范围预览"};
+
+function monParams(r){
+  const parts = [];
+  if (r.origin || r.city) parts.push("出发=" + (r.origin || r.city));
+  if (r.dest) parts.push("目的地=" + r.dest);
+  if (r.budget) parts.push("¥" + r.budget);
+  if (r.days) parts.push(r.days + "天");
+  if (r.date) parts.push(r.date);
+  if (r.transport && r.transport !== "auto") parts.push(r.transport);
+  if ((r.prefs || []).length) parts.push(r.prefs.join("/"));
+  return parts.join(" · ") || "-";
+}
+
+function monResult(r){
+  const x = r.result || {};
+  if (r.kind === "recommend")
+    return (x.n_dest ?? 0) + "个目的地" +
+      ((x.top || []).length ? "：" + x.top.join("、") : "");
+  if (r.kind === "plan")
+    return (x.n_plan ?? 0) + "套方案" + (x.dest ? " · " + x.dest : "") +
+      (x.mode ? " · " + x.mode : "");
+  if (r.kind === "scope")
+    return "可达 " + (x.total ?? "-") + " 城 / " + (x.n_prov ?? "-") + " 省";
+  return "-";
+}
+
+function renderMonStats(ov){
+  const t = ov.today || {};
+  const card = (label, val, sub) =>
+    `<div class="mon-card"><div class="mon-v">${val}</div>
+     <div class="mon-l">${label}</div><div class="mon-s">${sub || ""}</div></div>`;
+  $("#monStats").innerHTML =
+    card("今日请求", t.req ?? 0, "错误 " + (t.err ?? 0)) +
+    card("今日访客 IP", t.ips ?? 0, "") +
+    card("今日生成", t.gen ?? 0,
+         `近7天 成功${ov.gen_ok ?? 0} / 失败${ov.gen_fail ?? 0}`) +
+    card("Top IP", esc((ov.top_ips || [])[0]?.ip || "-"),
+         ((ov.top_ips || [])[0]?.n || 0) + " 次");
+  $("#monNote").textContent =
+    "日志目录 backend/data/monitor/ · 保留最近7天视图";
+}
+
+function renderMonLogs(kind, logs){
+  if (kind === "gen"){
+    $("#monHead").innerHTML =
+      `<tr><th>时间</th><th>IP</th><th>用户</th><th>类型</th>
+       <th>参数</th><th>结果</th><th>耗时</th><th>状态</th></tr>`;
+    $("#monRows").innerHTML = logs.map(r =>
+      `<tr><td>${esc((r.t || "").slice(5))}</td><td>${esc(r.ip)}</td>
+       <td>${esc(r.user || "-")}</td>
+       <td>${MON_KIND[r.kind] || esc(r.kind)}</td>
+       <td title="${esc(monParams(r))}">${esc(monParams(r))}</td>
+       <td>${r.ok ? esc(monResult(r)) : "-"}</td>
+       <td>${((r.ms || 0) / 1000).toFixed(1)}s</td>
+       <td>${r.ok ? "✓" : `<span class="mon-fail">✗</span>`}</td></tr>` +
+      (r.ok ? "" : `<tr class="mon-err"><td></td><td colspan="7">${esc(r.error || "")}</td></tr>`)
+    ).join("");
+  }else{
+    $("#monHead").innerHTML =
+      `<tr><th>时间</th><th>IP</th><th>用户</th><th>方法</th>
+       <th>路径</th><th>状态</th><th>耗时</th><th>UA</th></tr>`;
+    $("#monRows").innerHTML = logs.map(r =>
+      `<tr><td>${esc((r.t || "").slice(5))}</td><td>${esc(r.ip)}</td>
+       <td>${esc(r.user || "-")}</td><td>${esc(r.m)}</td>
+       <td title="${esc(r.p)}">${esc(r.p)}</td>
+       <td>${r.st >= 400 ? `<span class="mon-fail">${r.st}</span>` : r.st}</td>
+       <td>${r.ms ?? "-"}ms</td>
+       <td title="${esc(r.ua || "")}">${esc((r.ua || "").slice(0, 40))}</td></tr>`
+    ).join("");
+  }
+  if (!logs.length)
+    $("#monRows").innerHTML =
+      `<tr><td colspan="8" style="text-align:center;color:var(--ink3)">暂无日志</td></tr>`;
+}
+
+async function loadMonitor(){
+  try{
+    const ov = await apiFetch("/api/monitor/overview").then(r => r.json());
+    renderMonStats(ov);
+    const d = await apiFetch("/api/monitor/logs?kind=" + MON_TAB +
+                             "&n=200").then(r => r.json());
+    renderMonLogs(MON_TAB, d.logs || []);
+  }catch(e){}
+}
+
+function openMonitor(){
+  $("#monitorModal").classList.remove("hidden");
+  loadMonitor();
+}
+
 function bindAuth(){
   $("#btnLogin").onclick = doLogin;
   for (const id of ["#authUser", "#authPass"])
@@ -107,6 +201,17 @@ function bindAuth(){
     if (e.target.id === "adminModal") $("#adminModal").classList.add("hidden");
   });
   $("#btnAddUser").onclick = addUser;
+  $("#btnMonitor").onclick = openMonitor;
+  $("#btnMonClose").onclick = () => $("#monitorModal").classList.add("hidden");
+  $("#btnMonRefresh").onclick = loadMonitor;
+  $("#monitorModal").addEventListener("click", e => {
+    if (e.target.id === "monitorModal") $("#monitorModal").classList.add("hidden");
+  });
+  $$("#monTabs .chip").forEach(b => b.onclick = () => {
+    MON_TAB = b.dataset.v;
+    $$("#monTabs .chip").forEach(x => x.classList.toggle("on", x === b));
+    loadMonitor();
+  });
 }
 
 const state = { origin: null, dests: [], plans: [], intel: null, map: null,
@@ -160,6 +265,8 @@ async function init(){
   try{                                   // 账号门：启用后无有效 token → 登录页
     const me = await apiFetch("/api/auth/me").then(r => r.json());
     if (me.auth){ ME = me; applyMe(); }
+    // 未启用账号=本地开发模式；公网无账号部署时后端也只放行环回地址
+    else if (IS_LOCAL) $("#btnMonitor").classList.remove("hidden");
     hideAuth();
   }catch(e){ return; }                   // 401 → 登录门已显示，中止初始化
   try{ await apiFetch("/api/status"); }catch(e){}   // 唤醒后端（Render 冷启动）

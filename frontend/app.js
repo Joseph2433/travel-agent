@@ -383,6 +383,11 @@ function bindForm(){
     c.classList.add("on");
     queueScope();
   });
+  $("#chipsStyle").addEventListener("click", e => {
+    const c = e.target.closest(".chip"); if (!c) return;
+    $("#chipsStyle").querySelectorAll(".chip").forEach(x => x.classList.remove("on"));
+    c.classList.add("on");
+  });
   $("#chipsScope").addEventListener("click", e => {
     const c = e.target.closest(".chip"); if (!c) return;
     c.classList.toggle("on");
@@ -433,6 +438,7 @@ function collectParams(){
     days: state.getDays(),
     date: $("#inpDate").value || null,
     transport: $("#chipsTransport .chip.on").dataset.v,
+    style: $("#chipsStyle .chip.on").dataset.v,
     prefs: $$("#chipsPrefs .chip.on").map(c => c.dataset.v),
     provinces: state.provinces,
   };
@@ -745,7 +751,9 @@ function renderPlanDetail(p, r){
       <div class="day-items">${d.items.map(it => `
         <div class="it ${it.type}">
           <span class="slot">${it.slot}</span>
-          <span class="body"><span class="name">${it.name}</span><div class="note">${it.note||""}</div></span>
+          ${it.time ? `<span class="time">${it.time}</span>` : ""}
+          <span class="body"><span class="name">${it.name}</span><div class="note">${it.note||""}</div>
+            ${it.options && it.options.length ? `<div class="food-opts">备选 ${it.options.map(o => `${o.tier}·${o.name}${o.cost ? "(¥" + o.cost + ")" : ""}`).join(" / ")}</div>` : ""}</span>
           <span class="cost">${it.cost ? "¥" + it.cost : ""}</span>
         </div>`).join("")}
       </div>

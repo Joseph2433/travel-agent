@@ -252,7 +252,8 @@ def poi_search(city: str, keywords: str, poi_type: str = "", count: int = 8):
     if not amap_available():
         return None
     try:
-        params = {"keywords": keywords, "region": city, "page_size": count}
+        params = {"keywords": keywords, "region": city, "page_size": count,
+                  "show_fields": "business"}
         if poi_type:
             params["types"] = poi_type
         r = requests.get(AMAP_BASE + "/v5/place/text", params=params,
@@ -261,7 +262,7 @@ def poi_search(city: str, keywords: str, poi_type: str = "", count: int = 8):
         d = r.json()
         pois = []
         for p in d.get("pois") or []:
-            biz = p.get("biz_ext") or {}
+            biz = p.get("business") or p.get("biz_ext") or {}
             rating = biz.get("rating") if isinstance(biz, dict) else None
             cost = biz.get("cost") if isinstance(biz, dict) else None
             pois.append({

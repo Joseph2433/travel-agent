@@ -401,6 +401,96 @@ def _poi_foods(intel):
     return out
 
 
+# ------------------------------------------------- 风格 / 时间轴 / 美食备选 ----
+
+# 游玩风格：特种兵=早出晚归高密度；休闲随意=晚起留白；适中=常规
+_STYLE_CFG = {
+    "特种兵":   {"start": 7.5, "meal": 0.75, "gap": 0.25, "shift": -0.5, "take": +1},
+    "休闲随意": {"start": 10.0, "meal": 1.5, "gap": 1.0, "shift": +0.5, "take": -1},
+}
+_STYLE_DEF = {"start": 9.0, "meal": 1.0, "gap": 0.5, "shift": 0.0, "take": 0}
+
+# slot 标签 → 最早开始时刻（小时），再按风格 shift 微调
+_SLOT_EARLIEST = {"午餐": 11.5, "午后": 13.0, "下午": 13.5,
+                  "下午茶/夜宵": 15.0, "晚餐": 17.5, "晚上": 19.0}
+_DUR_DEF = {"景点": 3.0, "休闲": 1.5, "交通": 2.0}
+# 槽位 → 日内规范顺序（返程交通恒排当天末尾，去程恒排最前）
+_SLOT_ORDER = {"上午": 0, "全天": 0, "午餐": 3, "午后": 4, "下午": 5,
+               "下午茶/夜宵": 6, "晚餐": 7, "晚上": 8}
+
+
+def _item_rank(d, it):
+    if it.get("type") == "交通":
+        return 9 if "返程" in (it.get("name") or "") else -1
+    return _SLOT_ORDER.get(it.get("slot") or "", 5)
+
+
+def _style_cfg(style):
+    return {**_STYLE_DEF, **_STYLE_CFG.get(style or "", {})}
+
+
+def _hm(h):
+    m = round(max(0, min(h, 24)) * 60)
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def assign_times(days, style="适中"):
+    """给每个行程项打大致时间范围（it["time"]="HH:MM–HH:MM"）：
+    当天项目先按槽位规范顺序重排（去程最前、返程最后、午餐在午后前），
+    再从「出门时刻」顺推；slot 标签约束最早开始点；
+    风格决定起床早晚/吃饭快慢/项目间隔。"""
+    cfg = _style_cfg(style)
+    for d in days or []:
+        items = d.get("items") or []
+        items.sort(key=lambda it: _item_rank(d, it))
+        cur = cfg["start"]
+        for it in items:
+            ear = _SLOT_EARLIEST.get(it.get("slot") or "")
+            if ear is not None:
+                cur = max(cur, ear + cfg["shift"])
+            dur = 0.0
+            if it.get("type") == "美食":
+                dur = cfg["meal"]
+            else:
+                try:
+                    dur = float(it.get("hours") or 0)
+                except (TypeError, ValueError):
+                    dur = 0.0
+                if dur <= 0:
+                    dur = _DUR_DEF.get(it.get("type"), 1.5)
+            it["time"] = (f"{_hm(cur)}–{_hm(cur + dur)}"
+                          if cur < 23.9 else "深夜后")
+            cur += dur + cfg["gap"]
+    return days
+
+
+def food_options(pool, exclude="", limit=3):
+    """给一餐配不同价位备选：pool 兼容 KB foods({n,d,p}) 与 POI({name,rating,cost})，
+    按价格升序取 低/中/高 档各一个。返回 [{name,cost,tier,note}]。"""
+    cand, seen = [], {exclude}
+    for f in pool or []:
+        n = (f.get("n") or f.get("name") or "").strip()
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        try:
+            cost = round(float(f.get("p") if f.get("p") is not None
+                               else f.get("cost") or 0)) or None
+        except (TypeError, ValueError):
+            cost = None
+        cand.append({"name": n[:16], "cost": cost,
+                     "note": (f.get("d") or
+                              (f"评分{f['rating']}" if f.get("rating") else "")
+                              or "")[:40]})
+    cand.sort(key=lambda x: (x["cost"] is None, x["cost"] or 0))
+    sel = ([cand[0], cand[len(cand) // 2], cand[-1]] if len(cand) > limit
+           else cand)
+    for i, o in enumerate(sel):
+        o["tier"] = (["平价", "中档", "品质"][i] if len(sel) == 3
+                     else ("平价" if i == 0 else "升级"))
+    return sel
+
+
 def judge_intel(ctx, intel, days, prefs, date=None):
     """对搜到的情报做判断：剔除不合时令/低价值项，按天数取舍，输出核心体验清单。
     date: 出发日 YYYY-MM-DD → 生成假期/预售/逐日天气提示。"""
@@ -516,8 +606,9 @@ def _real_rail(origin_name, dest_name, dep_date=None, ret_date=None):
 
 
 def compose_plans(ctx, origin, dest_name, budget, days, transport, prefs,
-                  judged, date=None):
-    """编排 3-5 套差异化行程方案。date: 出发日 YYYY-MM-DD（可选）。"""
+                  judged, date=None, style="适中"):
+    """编排 3-5 套差异化行程方案。date: 出发日 YYYY-MM-DD（可选）；
+    style: 特种兵|适中|休闲随意——影响每日密度与时间轴。"""
     c = get_city(dest_name) or pool_profile(dest_name)
     km = geo.haversine_km(origin["lat"], origin["lng"], c["lat"], c["lng"])
 
@@ -561,7 +652,7 @@ def compose_plans(ctx, origin, dest_name, budget, days, transport, prefs,
     for t in themes[:5]:
         plan = _build_plan(t, c, origin, kept, foods, days,
                            transport_info, budget, prefs,
-                           qunar=judged.get("qunar_scenic"))
+                           qunar=judged.get("qunar_scenic"), style=style)
         plan["guide"] = build_plan_guide(plan, judged)
         plans.append(plan)
     return {"plans": plans, "transport": transport_info, "km": km,
@@ -618,8 +709,9 @@ def _qunar_price(name, scenic):
 
 
 def _build_plan(theme, city, origin, attractions, foods, days,
-                transport, budget, prefs, qunar=None):
-    """把景点/美食排进 days 天的日程槽位。"""
+                transport, budget, prefs, qunar=None, style="适中"):
+    """把景点/美食排进 days 天的日程槽位。style 影响每日密度与时间轴。"""
+    cfg = _style_cfg(style)
     density = theme["density"]
     atts = list(attractions)
     used = []
@@ -633,18 +725,20 @@ def _build_plan(theme, city, origin, attractions, foods, days,
         if d == 1:
             items.append({"slot": "上午", "type": "交通",
                           "name": f"{origin['name']} → {city['name']}",
-                          "note": transport["outbound"], "cost": transport["cost"]})
+                          "note": transport["outbound"], "cost": transport["cost"],
+                          "hours": transport.get("hours")})
             pool = normal
         elif d == days:
             items.append({"slot": "下午", "type": "交通",
                           "name": f"{city['name']} → {origin['name']} 返程",
-                          "note": transport["back"], "cost": transport["cost"]})
+                          "note": transport["back"], "cost": transport["cost"],
+                          "hours": transport.get("hours")})
             pool = normal
         else:
             pool = normal
 
-        # 挑选当日景点
-        take = density if 1 < d < days else 1
+        # 挑选当日景点；特种兵多加一个、休闲随意减一个
+        take = max(1, (density if 1 < d < days else 1) + cfg["take"])
         picked = []
         # 中间日优先安排"需一整天"的大景点（每个行程最多2个大景点日）
         big_cap = 1 if days <= 3 else 2
@@ -672,25 +766,30 @@ def _build_plan(theme, city, origin, attractions, foods, days,
                           "note": a["desc"],
                           "cost": real if real is not None else a["ticket"],
                           "hours": a["hours"]})
-        # 餐饮槽位：午/晚
+        # 餐饮槽位：午/晚；每餐附不同价位备选
         f1 = foods[(d - 1) % len(foods)] if foods else None
         f2 = foods[(d) % len(foods)] if foods and len(foods) > 1 else None
         if d < days and f1:
             items.append({"slot": "午餐", "type": "美食", "name": f1["n"],
-                          "note": f1["d"], "cost": f1["p"]})
+                          "note": f1["d"], "cost": f1["p"],
+                          "options": food_options(foods, f1["n"])})
         if f2:
             lab = "晚餐" if d < days else "午餐"
             items.append({"slot": lab, "type": "美食", "name": f2["n"],
-                          "note": f2["d"], "cost": f2["p"]})
+                          "note": f2["d"], "cost": f2["p"],
+                          "options": food_options(foods, f2["n"])})
         if theme.get("resort") and 1 < d < days:
             items.append({"slot": "午后", "type": "休闲", "name": "酒店休憩/咖啡时光",
                           "note": "留白时间，度假节奏", "cost": 40})
         if theme["id"] == "foodie" and 1 < d < days and foods:
             extra = foods[(d + 1) % len(foods)]
             items.append({"slot": "下午茶/夜宵", "type": "美食", "name": extra["n"],
-                          "note": extra["d"], "cost": extra["p"]})
+                          "note": extra["d"], "cost": extra["p"],
+                          "options": food_options(foods, extra["n"])})
         itinerary.append({"day": d, "title": _day_title(d, days, picked),
                           "items": items})
+
+    assign_times(itinerary, style)
 
     tickets = sum((rp if (rp := _qunar_price(a["n"], qunar)) is not None
                    else a["ticket"]) for a in used)

@@ -150,6 +150,8 @@ submit_result 提交结论。
 4) 编排 3-5 套差异化方案（主题如：经典全景/寻味美食/深度慢游/精华快闪/舒适度假，
    可按目的地特点自由命名）：
    - 每套 days 数量 = 用户天数；每天排 景点/美食/休闲 槽位（上午/下午/晚上/全天/午餐/晚餐）
+   - 出行风格：特种兵式=早出晚归高密度（可加早餐/夜宵档）；休闲随意式=少排点、
+     午间留白、睡到自然醒；适中=常规节奏
    - 景点名可来自知识库 attractions 或 get_city_intel/search_pois 返回的高德POI名称；
      美食名可来自知识库 foods 或高德美食POI；都可混用，优先选评分高的真实POI
    - 不要排往返交通项（系统会自动插入首尾两天）；抵达日少排点、返程日只排上午
@@ -542,7 +544,7 @@ def n_agent_plan(s: S):
     user_msg = json.dumps({
         "出发地": origin["name"], "目的地": req["dest"], "预算": req["budget"],
         "天数": req["days"], "出行方式": req.get("transport", "auto"),
-        "出发日期": _date_ctx(req),
+        "出发日期": _date_ctx(req), "出行风格": req.get("style") or "适中",
         "偏好": req.get("prefs") or [], "当前月份": datetime.now().month,
     }, ensure_ascii=False)
 
@@ -570,7 +572,8 @@ def n_agent_plan(s: S):
         result = tools.compose_plans(None, origin, req["dest"], req["budget"],
                                      req["days"], req.get("transport", "auto"),
                                      req.get("prefs") or [], judged,
-                                     date=req.get("date"))
+                                     date=req.get("date"),
+                                     style=req.get("style"))
         return {"intel": intel, "judged": judged, "result": result,
                 "guide": tools.build_guide(c, intel, judged,
                                            tool_data=tool_data,
@@ -596,6 +599,8 @@ def n_assemble(s: S):
     att_map = {a["n"]: a for a in c["attractions"]}
     food_map = {f["n"]: f for f in c["foods"]}
     poi_map = _poi_map(tool_data)                   # 高德实时POI也可作行程项
+    food_pool = (list(food_map.values())
+                 + list(_poi_food_map(tool_data).values()))  # 美食备选池
 
     plans = []
     for i, p in enumerate(out.plans):
@@ -605,9 +610,12 @@ def n_assemble(s: S):
             if d.day == 1:
                 items.append({"slot": "上午", "type": "交通",
                               "name": f"{origin['name']} → {c['name']}",
-                              "note": transport["outbound"], "cost": transport["cost"]})
+                              "note": transport["outbound"],
+                              "cost": transport["cost"],
+                              "hours": transport.get("hours")})
             for it in d.items:
-                mapped = _map_item(it, att_map, food_map, poi_map)
+                mapped = _map_item(it, att_map, food_map, poi_map,
+                                   food_pool=food_pool)
                 if mapped:
                     items.append(mapped)
                     if mapped.get("_ticket"):
@@ -615,13 +623,16 @@ def n_assemble(s: S):
             if d.day == req["days"]:
                 items.append({"slot": "下午", "type": "交通",
                               "name": f"{c['name']} → {origin['name']} 返程",
-                              "note": transport["back"], "cost": transport["cost"]})
+                              "note": transport["back"],
+                              "cost": transport["cost"],
+                              "hours": transport.get("hours")})
             title = (d.title or "").strip() or tools._day_title(
                 d.day, req["days"], [a for a in c["attractions"]
                                      if any(i["name"] == a["n"] for i in items)])
             days_out.append({"day": d.day, "title": title[:14], "items": items})
         if not days_out:
             continue
+        tools.assign_times(days_out, req.get("style") or "适中")
         b = geo.trip_budget(c, req["days"], transport["cost"],
                             hotel_factor=getattr(p, "hotel_factor", 1.0) or 1.0,
                             food_factor=getattr(p, "food_factor", 1.0) or 1.0,
@@ -642,7 +653,8 @@ def n_assemble(s: S):
         result = tools.compose_plans(None, origin, req["dest"], req["budget"],
                                      req["days"], req.get("transport", "auto"),
                                      req.get("prefs") or [], judged,
-                                     date=req.get("date"))
+                                     date=req.get("date"),
+                                     style=req.get("style"))
         return {"intel": intel, "judged": judged, "result": result,
                 "guide": tools.build_guide(c, intel, judged,
                                            tool_data=tool_data,
@@ -777,6 +789,18 @@ def _poi_map(tool_data):
     return m
 
 
+def _poi_food_map(tool_data):
+    """汇总 ReAct 中 get_city_intel 的美食POI：{名称: {name,rating,cost}}，
+    供每餐"不同价位备选"取真实周边餐厅。"""
+    m = {}
+    for td in (tool_data.get("get_city_intel") or []):
+        if isinstance(td, dict):
+            for p in td.get("pois_food") or []:
+                if isinstance(p, dict) and p.get("name"):
+                    m[p["name"]] = p
+    return m
+
+
 def _poi_cost(p, default):
     try:
         return max(0, round(float(p.get("cost") or default)))
@@ -784,9 +808,10 @@ def _poi_cost(p, default):
         return default
 
 
-def _map_item(it, att_map, food_map, poi_map=None):
+def _map_item(it, att_map, food_map, poi_map=None, food_pool=None):
     """把模型给的名字映射回真实对象：知识库 → 高德POI → 丢弃/通配。
-    支持子串模糊匹配；查无实据的景点一律丢弃（防幻觉）。"""
+    支持子串模糊匹配；查无实据的景点一律丢弃（防幻觉）。
+    food_pool 提供后，美食项附不同价位备选 options。"""
     name, typ = (it.name or "").strip(), (it.type or "景点")
     poi_map = poi_map or {}
     if typ == "景点":
@@ -811,15 +836,19 @@ def _map_item(it, att_map, food_map, poi_map=None):
             (v for k, v in food_map.items() if k in name or name in k), None)
         if f:
             return {"slot": it.slot, "type": "美食", "name": f["n"],
-                    "note": f["d"], "cost": f["p"]}
+                    "note": f["d"], "cost": f["p"],
+                    "options": tools.food_options(food_pool, exclude=f["n"])}
         p = poi_map.get(name) or next(
             (v for k, v in poi_map.items() if k in name or name in k), None)
         if p:
             return {"slot": it.slot, "type": "美食", "name": p["name"][:16],
                     "note": f"高德POI · 评分{p.get('rating') or '—'}",
-                    "cost": _poi_cost(p, 60)}
+                    "cost": _poi_cost(p, 60),
+                    "options": tools.food_options(food_pool,
+                                                  exclude=p["name"][:16])}
         return {"slot": it.slot, "type": "美食", "name": name[:16],
-                "note": "当地特色", "cost": 60}
+                "note": "当地特色", "cost": 60,
+                "options": tools.food_options(food_pool, exclude=name[:16])}
     return {"slot": it.slot, "type": "休闲", "name": name[:16],
             "note": "", "cost": 40}
 
@@ -891,7 +920,8 @@ def n_compose(s: S):
     result = tools.compose_plans(None, s["origin"], req["dest"], req["budget"],
                                  req["days"], req.get("transport", "auto"),
                                  req.get("prefs") or [], s["judged"],
-                                 date=req.get("date"))
+                                 date=req.get("date"),
+                                 style=req.get("style"))
     c = next((x for x in tools.load_cities()
               if x["name"] == req["dest"].rstrip("市")), None) \
         or _pseudo_city(req["dest"])

@@ -184,6 +184,7 @@ class RecommendReq(BaseModel):
     days: int = 3
     date: str | None = None            # 出发日期 YYYY-MM-DD（可选）
     transport: str = "auto"
+    style: str = "适中"               # 游玩风格：特种兵|适中|休闲随意
     prefs: list[str] = []
     provinces: list[str] = []          # 用户圈定的出行范围（省份名），空=全部可达
 

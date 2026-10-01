@@ -292,9 +292,13 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 .it{display:flex;gap:12px;font-size:13.5px;line-height:1.55}
 .it .slot{flex-shrink:0;width:44px;font-size:11px;color:var(--teal-d);font-weight:700;
   padding-top:2px;letter-spacing:1px}
+.it .time{flex-shrink:0;width:86px;font-size:11px;color:var(--ink3);padding-top:2px;
+  font-variant-numeric:tabular-nums}
 .it .body{flex:1}
 .it .name{font-weight:600}
 .it .note{color:var(--ink3);font-size:12px;margin-top:2px}
+.it .food-opts{color:var(--ink2);font-size:11.5px;margin-top:3px;
+  background:var(--paper);border-radius:6px;padding:3px 8px;display:inline-block}
 .it .cost{flex-shrink:0;font-size:12px;color:var(--ink2);padding-top:2px}
 .it.美食 .name::after{content:"🍜";margin-left:6px;font-size:12px}
 .it.景点 .name::after{content:"📍";margin-left:6px;font-size:12px}

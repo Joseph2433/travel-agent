@@ -19,23 +19,29 @@ TravelAgent  backend/agent.py        # 门面：一次请求 = 一次 LangGraph 
    │
    ├─► llm.py         ── OpenAI兼容协议(Kimi/DeepSeek/OpenAI)  需 LLM_API_KEY
    ├─► agent_tools.py ── 暴露给模型的 @tool：scan_destinations / get_city_profile
-   │                     / get_city_intel / query_trains(往返) / estimate_transport
+   │                     / get_city_intel / search_pois(任意类别POI实时搜索)
+   │                     / query_trains(往返) / estimate_transport
    │                     / calc_budget / submit_result(终止+结构化提交)
    ├─► schemas.py     ── pydantic 输出契约（模型只给名字/排序/理由）
    ├─► tools.py       ── 规则引擎实现（无key兜底）+ LLM结论合并校验
-   ├─► apis.py        ── 高德 Web服务(IP/地理编码/POI/天气/驾车)  需 AMAP_KEY
+   ├─► apis.py        ── 高德 Web服务(IP/地理编码/行政区/POI/天气/驾车)  需 AMAP_KEY
    │                  ── 12306 queryG/queryTicketPrice  真实往返车次+余票+票价
    │                  ── Bing/DuckDuckGo  攻略网页摘要
    ├─► geo.py         ── 距离/交通/预算估算模型（无网兜底）
-   └─► data/cities.json             # 25 目的地知识库（景点/美食/贴士/消费档）
+   └─► data/cities.json             # 25 城种子知识库：画像/消费档兜底，
+                                     # 景点美食可由高德POI实时数据取代
 ```
 
 **真 Agent 模式**（配 `LLM_API_KEY` 后）：模型自主决定调哪些工具、调几次——
 目的地推荐时它自己扫描候选、挑感兴趣的城市深入看画像、打分排序并给首推；
-行程规划时它自己查攻略摘要/天气/POI/12306往返车次，编排 3-5 套差异化方案
+行程规划时它自己查攻略摘要/天气/POI/12306往返车次，还能用 `search_pois`
+实时搜任意类别的景点/美食（带评分/参考价/地址），编排 3-5 套差异化方案
 （每天槽位、餐厅景点、档位系数都由它决定），推理与工具调用全程进 trace 回放。
-代码的职责只剩：**校验**（景点名必须存在于知识库，防幻觉）和**算数**
-（票价/预算永不由模型生成）。模型失联/输出不合法时原地降级规则引擎。
+代码的职责只剩：**校验**（景点名必须是知识库条目或高德真实POI，防幻觉）
+和**算数**（票价/预算永不由模型生成）。模型失联/输出不合法时原地降级规则引擎。
+
+目的地不限于知识库 25 城：前端「指定目的地」可填任意城市（如景德镇/大理），
+非知识库城市走「地理编码定位 + 高德POI实时编排」，预算用估算系数兜底。
 
 ## 运行
 
@@ -66,9 +72,11 @@ cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
 |---|---|---|
 | GET | /api/status | 数据源/LLM 可用性 |
 | GET | /api/cities | 城市列表 |
+| GET | /api/geo/provinces | 34 省级列表（出发地第一级） |
+| GET | /api/geo/cities?province=xx | 该省地级市（高德行政区接口） |
 | POST | /api/locate | GPS 坐标 → 最近出发城市 |
 | POST | /api/agent/destinations | 阶段一：推荐目的地（含 trace + AI复核） |
-| POST | /api/agent/plans | 阶段二：搜索+判断+生成 3-5 套方案 |
+| POST | /api/agent/plans | 阶段二：搜索+判断+生成 3-5 套方案（可指定任意目的地） |
 | POST | /api/agent/destinations/stream | 同上，SSE 流式：逐步推 trace 事件 |
 | POST | /api/agent/plans/stream | 同上，SSE 流式 |
 

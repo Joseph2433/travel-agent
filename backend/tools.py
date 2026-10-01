@@ -382,7 +382,8 @@ def _poi_attractions(intel, cap):
                 must = 3.0
             out.append({"n": n,
                         "desc": f"高德热门POI·评分{p.get('rating') or '—'}",
-                        "ticket": 0, "hours": 3, "must": must})
+                        "ticket": 0, "hours": 3, "must": must,
+                        "loc": _parse_loc(p.get("location"))})
     return out[:cap]
 
 
@@ -398,7 +399,7 @@ def _poi_foods(intel):
             cost = 60
         out.append({"n": p["name"],
                     "d": f"高德热门POI·评分{p.get('rating') or '—'}",
-                    "p": cost})
+                    "p": cost, "loc": _parse_loc(p.get("location"))})
     return out
 
 
@@ -455,6 +456,42 @@ def _item_rank(d, it):
     return (rank, 1 if night_ok else 0)
 
 
+_geo_cache = {}                                # {(城市,名称): (lat,lng)|None}
+
+
+def _parse_loc(s):
+    """高德 location 字符串 'lng,lat' → (lat,lng)。"""
+    try:
+        lng, lat = (s or "").split(",")[:2]
+        return (float(lat), float(lng))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def geocode_poi(city, name):
+    """景点/餐厅名 → 坐标：高德POI同名匹配（惰性+缓存），匹配不到返回 None。"""
+    key = (city or "", name or "")
+    if key in _geo_cache:
+        return _geo_cache[key]
+    loc = None
+    d = apis.poi_search(city, name, count=1) if city and name else None
+    p = ((d or {}).get("pois") or [None])[0]
+    if p:
+        cn, pn = _core_name(name), _core_name(p.get("name") or "")
+        if cn and pn and (cn in pn or pn in cn):      # 同名才认，防串到无关地点
+            loc = _parse_loc(p.get("location"))
+    if len(_geo_cache) > 800:
+        _geo_cache.clear()
+    _geo_cache[key] = loc
+    return loc
+
+
+def _transit_h(prev, loc):
+    """相邻项目通勤时间估算：直线距离按市内≈28km/h + 12min 步行候车，封顶80min。"""
+    km = geo.haversine_km(prev[0], prev[1], loc[0], loc[1])
+    return min(1.3, 0.12 + km / 28.0)
+
+
 def _style_cfg(style):
     return {**_STYLE_DEF, **_STYLE_CFG.get(style or "", {})}
 
@@ -464,17 +501,34 @@ def _hm(h):
     return f"{m // 60:02d}:{m % 60:02d}"
 
 
-def assign_times(days, style="适中"):
+def assign_times(days, style="适中", city=None):
     """给每个行程项打大致时间范围（it["time"]="HH:MM–HH:MM"）：
     当天项目先按槽位规范顺序重排（去程最前、返程最后、午餐在午后前），
-    再从「出门时刻」顺推；slot 标签约束最早开始点；
-    风格决定起床早晚/吃饭快慢/项目间隔。"""
+    再从「出门时刻」顺推；相邻项目间按坐标估通勤（酒店按市中心），
+    餐/夜类槽位有最早开始约束；风格决定起床早晚/吃饭快慢。"""
     cfg = _style_cfg(style)
+    cname = (city or {}).get("name") or ""
+    try:
+        center = (float(city["lat"]), float(city["lng"]))
+    except (TypeError, KeyError, ValueError):
+        center = None
     for d in days or []:
         items = d.get("items") or []
         items.sort(key=lambda it: _item_rank(d, it))
         cur = cfg["start"]
+        prev_loc = center                         # 酒店按市中心估
         for it in items:
+            name = it.get("name") or ""
+            if it.get("type") == "交通" and "返程" not in name:
+                loc, inter = center, 0.0          # 去程落地=市中心，不占通勤
+            elif it.get("type") == "交通":
+                loc, inter = None, cfg["gap"]
+            else:
+                loc = it.get("loc") or geocode_poi(cname, name)
+                inter = cfg["gap"]
+                if prev_loc and loc:
+                    inter = max(inter, _transit_h(prev_loc, loc))
+            cur += inter
             ear = _SLOT_EARLIEST.get(it.get("slot") or "")
             if ear is not None:
                 cur = max(cur, ear + cfg["shift"])
@@ -498,7 +552,9 @@ def assign_times(days, style="适中"):
                                  m.group(1) if m else None):
                     it["note"] = ((it.get("note") or "")
                                   + " ⏰此时段或已过闭园时间，建议提前")
-            cur += dur + cfg["gap"]
+            cur += dur
+            if loc:
+                prev_loc = loc
     return days
 
 
@@ -812,7 +868,7 @@ def _build_plan(theme, city, origin, attractions, foods, days,
                 slot = "下午"
             real = _qunar_price(a["n"], qunar)
             items.append({"slot": slot, "type": "景点", "name": a["n"],
-                          "note": a["desc"],
+                          "note": a["desc"], "loc": a.get("loc"),
                           "cost": real if real is not None else a["ticket"],
                           "hours": a["hours"]})
         # 餐饮槽位：午/晚；每餐附不同价位备选
@@ -820,12 +876,12 @@ def _build_plan(theme, city, origin, attractions, foods, days,
         f2 = foods[(d) % len(foods)] if foods and len(foods) > 1 else None
         if d < days and f1:
             items.append({"slot": "午餐", "type": "美食", "name": f1["n"],
-                          "note": f1["d"], "cost": f1["p"],
+                          "note": f1["d"], "cost": f1["p"], "loc": f1.get("loc"),
                           "options": food_options(foods, f1["n"])})
         if f2:
             lab = "晚餐" if d < days else "午餐"
             items.append({"slot": lab, "type": "美食", "name": f2["n"],
-                          "note": f2["d"], "cost": f2["p"],
+                          "note": f2["d"], "cost": f2["p"], "loc": f2.get("loc"),
                           "options": food_options(foods, f2["n"])})
         if theme.get("resort") and 1 < d < days:
             items.append({"slot": "午后", "type": "休闲", "name": "酒店休憩/咖啡时光",
@@ -834,11 +890,12 @@ def _build_plan(theme, city, origin, attractions, foods, days,
             extra = foods[(d + 1) % len(foods)]
             items.append({"slot": "下午茶/夜宵", "type": "美食", "name": extra["n"],
                           "note": extra["d"], "cost": extra["p"],
+                          "loc": extra.get("loc"),
                           "options": food_options(foods, extra["n"])})
         itinerary.append({"day": d, "title": _day_title(d, days, picked),
                           "items": items})
 
-    assign_times(itinerary, style)
+    assign_times(itinerary, style, city)
 
     tickets = sum((rp if (rp := _qunar_price(a["n"], qunar)) is not None
                    else a["ticket"]) for a in used)

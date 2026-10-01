@@ -272,6 +272,7 @@ def poi_search(city: str, keywords: str, poi_type: str = "", count: int = 8):
                 "addr": p.get("address") if isinstance(p.get("address"), str) else "",
                 "rating": rating, "cost": cost,
                 "open_hours": (open_hours or "")[:40] or None,
+                "location": p.get("location"),
             })
         return {"pois": pois, "src": "amap"}
     except Exception:

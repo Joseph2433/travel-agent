@@ -632,7 +632,7 @@ def n_assemble(s: S):
             days_out.append({"day": d.day, "title": title[:14], "items": items})
         if not days_out:
             continue
-        tools.assign_times(days_out, req.get("style") or "适中")
+        tools.assign_times(days_out, req.get("style") or "适中", c)
         b = geo.trip_budget(c, req["days"], transport["cost"],
                             hotel_factor=getattr(p, "hotel_factor", 1.0) or 1.0,
                             food_factor=getattr(p, "food_factor", 1.0) or 1.0,
@@ -835,7 +835,8 @@ def _map_item(it, att_map, food_map, poi_map=None, food_pool=None):
                                f"评分{p.get('rating') or '—'}"
                                + (f" · 开放{oh}" if oh else "")
                                + f" · {(p.get('addr') or '')[:24]}",
-                       "cost": cost, "hours": 3, "_ticket": cost}
+                       "cost": cost, "hours": 3, "_ticket": cost,
+                       "loc": tools._parse_loc(p.get("location"))}
         if res is None:
             return None
         if res["slot"] in late_slots and not tools._night_ok(
@@ -855,6 +856,7 @@ def _map_item(it, att_map, food_map, poi_map=None, food_pool=None):
             return {"slot": it.slot, "type": "美食", "name": p["name"][:16],
                     "note": f"高德POI · 评分{p.get('rating') or '—'}",
                     "cost": _poi_cost(p, 60),
+                    "loc": tools._parse_loc(p.get("location")),
                     "options": tools.food_options(food_pool,
                                                   exclude=p["name"][:16])}
         return {"slot": it.slot, "type": "美食", "name": name[:16],

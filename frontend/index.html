@@ -121,38 +121,46 @@
   </div>
 </section>
 
-<!-- ═══════════ 目的地推荐 ═══════════ -->
+<!-- ═══════════ 目的地推荐（独立页面） ═══════════ -->
 <section class="stage hidden" id="stageDest">
   <div class="wrap">
+    <div class="page-nav"><button class="btn ghost back-btn" data-back="home">← 调整出行条件</button></div>
+    <details class="trace-replay"><summary>Agent 思考回放</summary><ol class="trace" id="traceReplayDest"></ol></details>
     <h2 class="sec-title">为你挑了这些地方<small id="destMeta"></small></h2>
     <div id="mapBox" class="map-box"></div>
     <div class="dest-grid" id="destGrid"></div>
+    <div class="more-wrap" id="moreWrap"></div>
   </div>
 </section>
 
-<!-- ═══════════ 出游方案 ═══════════ -->
+<!-- ═══════════ 出游方案（独立页面） ═══════════ -->
 <section class="stage hidden" id="stagePlans">
   <div class="wrap">
+    <div class="page-nav"><button class="btn ghost back-btn" data-back="dest">← 返回目的地推荐</button></div>
+    <details class="trace-replay"><summary>Agent 思考回放</summary><ol class="trace" id="traceReplayPlans"></ol></details>
     <h2 class="sec-title" id="plansTitle">出游方案</h2>
     <div class="intel-bar" id="intelBar"></div>
     <div class="plan-list" id="planList"></div>
+    <div id="guideBox"></div>
   </div>
 </section>
 
-<!-- ═══════════ 方案详情抽屉 ═══════════ -->
-<div class="drawer-mask hidden" id="drawerMask"></div>
-<aside class="drawer" id="drawer">
-  <button class="drawer-close" id="drawerClose">✕</button>
-  <div id="drawerBody"></div>
-</aside>
+<!-- ═══════════ 方案详情（整页，替代抽屉） ═══════════ -->
+<section class="stage hidden" id="stageDetail">
+  <div class="wrap">
+    <div class="page-nav"><button class="btn ghost back-btn" data-back="plans">← 全部方案</button></div>
+    <div class="detail-body" id="detailBody"></div>
+  </div>
+</section>
 
 <footer class="footer">
-  <div class="wrap">旅图 TravelAgent · Agent 架构演示 — 高德API / 12306 / 本地知识库 多源融合</div>
+  <div class="wrap">旅图 TravelAgent · Agent 架构演示 — 高德API / 12306 / 去哪儿 / 小红书 / 全网热榜 多源融合</div>
 </footer>
 
 <div class="toast" id="toast"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="config.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -1,8 +1,48 @@
 /* ═══════════ 旅图 TravelAgent 前端逻辑 ═══════════ */
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
+
+/* 后端地址：默认同源（本地开发/后端托管前端）。
+   拆分部署时：config.js 里写 window.API_BASE，或带 ?api=https://xxx
+   访问一次即写入 localStorage，之后免带参。 */
+const API_BASE = (() => {
+  const q = new URLSearchParams(location.search).get("api");
+  if (q) localStorage.setItem("api_base", q.replace(/\/+$/, ""));
+  return (localStorage.getItem("api_base") || window.API_BASE || "")
+    .replace(/\/+$/, "");
+})();
+
 const state = { origin: null, dests: [], plans: [], intel: null, map: null,
-                provinces: [] };
+                provinces: [], view: "home", planIdx: null, guide: null,
+                lastPlanResp: null };
+
+/* ── 页面视图路由：home(表单) / trace(思考) / dest(推荐) / plans(方案) / plan(详情)
+   整页切换 + hash 支持浏览器前进后退 ── */
+const VIEW_EL = { home: ".hero", trace: "#stageTrace", dest: "#stageDest",
+                  plans: "#stagePlans", plan: "#stageDetail" };
+const VIEW_HASH = { home: "", trace: "", dest: "#dest",
+                    plans: "#plans", plan: "#plan" };
+
+function showView(v, push = true){
+  state.view = v;
+  for (const [key, sel] of Object.entries(VIEW_EL))
+    $(sel).classList.toggle("hidden", key !== v);
+  window.scrollTo({top: 0});
+  const h = VIEW_HASH[v];
+  if (push && location.hash !== h) history.pushState(null, "", h || location.pathname);
+}
+
+function viewFromHash(){
+  return Object.keys(VIEW_HASH).find(k => VIEW_HASH[k] === location.hash) || "home";
+}
+window.addEventListener("hashchange", () => {
+  const v = viewFromHash();
+  if (v === "dest" && !state.dests.length) return showView("home", false);
+  if (v === "plans" && !state.plans.length) return showView("home", false);
+  if (v === "plan" && state.planIdx == null)
+    return showView(state.plans.length ? "plans" : "home", false);
+  showView(v, false);
+});
 
 const ICONS = { pin:"◎", scan:"◈", rank:"✦", search:"⌕", judge:"⚖", rail:"⇄", plan:"▤", brain:"❖", pen:"✎", think:"✧", tool:"⚙", observe:"◉" };
 
@@ -11,11 +51,16 @@ function toast(msg, ms = 2600){
   setTimeout(() => t.classList.remove("show"), ms);
 }
 
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
 /* ── 初始化 ── */
 async function init(){
   bindForm();
+  showView("home", false);
+  if (location.hash) history.replaceState(null, "", location.pathname);
   try{
-    const st = await fetch("/api/status").then(r => r.json());
+    const st = await fetch(API_BASE + "/api/status").then(r => r.json());
     const dot = $("#dotAmap"), lbl = $("#lblAmap");
     if (st.amap){ dot.classList.add("ok"); lbl.textContent = "高德API"; }
     else { dot.classList.add("warn"); lbl.textContent = "高德(未配Key)"; }
@@ -24,7 +69,7 @@ async function init(){
     else { ld.classList.add("warn"); ll.textContent = "规则模式"; }
   }catch(e){}
   try{
-    const {provinces} = await fetch("/api/geo/provinces").then(r => r.json());
+    const {provinces} = await fetch(API_BASE + "/api/geo/provinces").then(r => r.json());
     const ps = $("#selProv");
     ps.innerHTML = provinces.map(p => `<option>${p}</option>`).join("");
     ps.value = "北京";
@@ -39,7 +84,7 @@ async function loadCities(prov){
   const sel = $("#selCity");
   sel.innerHTML = `<option>加载中…</option>`;
   try{
-    const {cities} = await fetch("/api/geo/cities?province=" + encodeURIComponent(prov))
+    const {cities} = await fetch(API_BASE + "/api/geo/cities?province=" + encodeURIComponent(prov))
       .then(r => r.json());
     sel.innerHTML = cities.map(c =>
       `<option value="${c.name}" data-lat="${c.lat ?? ""}" data-lng="${c.lng ?? ""}">${c.name}</option>`
@@ -59,7 +104,7 @@ async function loadScope(){
   if (!opt || !opt.value) return;
   const body = collectParams();
   try{
-    const r = await fetch("/api/agent/scope", {
+    const r = await fetch(API_BASE + "/api/agent/scope", {
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify(body)
     }).then(r => r.json());
@@ -86,7 +131,7 @@ function locateByGPS(silent){
   note.textContent = "定位中…";
   navigator.geolocation.getCurrentPosition(async pos => {
     try{
-      const r = await fetch("/api/locate", {
+      const r = await fetch(API_BASE + "/api/locate", {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({lat: pos.coords.latitude, lng: pos.coords.longitude})
       }).then(r => r.json());
@@ -145,8 +190,13 @@ function bindForm(){
   });
   $("#btnGeo").onclick = () => locateByGPS(false);
   $("#btnGo").onclick = runRecommend;
-  $("#drawerClose").onclick = $("#drawerMask").onclick = closeDrawer;
-  document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+  /* 页面返回条：data-back 指目标视图 */
+  document.addEventListener("click", e => {
+    const b = e.target.closest(".back-btn"); if (!b) return;
+    const v = b.dataset.back;
+    showView(v === "dest" && !state.dests.length ? "home" : v);
+  });
+  document.addEventListener("keydown", e => { if (e.key === "Escape") history.back(); });
 }
 
 function collectParams(){
@@ -165,12 +215,11 @@ function collectParams(){
 
 /* ── Agent 时间线：SSE 流式实时渲染 ── */
 function beginTrace(title){
+  showView("trace");
   const sec = $("#stageTrace"), list = $("#traceList");
   $("#traceTitle").textContent = title || "Agent 正在思考";
   $("#traceSpinner").classList.remove("done");
-  sec.classList.remove("hidden");
   list.innerHTML = "";
-  sec.scrollIntoView({behavior: "smooth", block: "start"});
 }
 function addTraceStep(s){
   const li = document.createElement("li");
@@ -183,7 +232,7 @@ function endTrace(){ $("#traceSpinner").classList.add("done"); }
 
 /* POST + SSE 流读取：每个 step 事件立刻上屏，done 返回完整结果 */
 async function streamPost(url, body, onStep){
-  const resp = await fetch(url, {
+  const resp = await fetch(API_BASE + url, {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify(body)
   });
@@ -212,8 +261,6 @@ async function streamPost(url, body, onStep){
 /* ── 阶段一：目的地推荐 ── */
 async function runRecommend(){
   const btn = $("#btnGo"); btn.disabled = true; btn.textContent = "规划中…";
-  $("#stageDest").classList.add("hidden");
-  $("#stagePlans").classList.add("hidden");
   const params = collectParams();
   const direct = ($("#inpDest").value || "").trim();
   if (direct){                       // 指定目的地 → 跳过推荐，直接出方案
@@ -231,6 +278,7 @@ async function runRecommend(){
     if (!state.dests.length) toast(r.message || "没有可行目的地");
   }catch(e){
     endTrace();
+    showView("home");
     toast("服务异常：" + e.message);
   }finally{
     btn.disabled = false;
@@ -243,7 +291,9 @@ const MEDALS = ["NO.1","NO.2","NO.3","NO.4","NO.5","NO.6"];
 function renderDestinations(r){
   const sec = $("#stageDest"), grid = $("#destGrid");
   $("#destMeta").textContent =
-    `从 ${r.origin.name} 出发 · ${state.dests.length} 个候选 · 按综合得分排序`
+    `从 ${r.origin.name} 出发 · 精选 ${state.dests.length} 个`
+    + (r.total_feasible ? ` · 共 ${r.total_feasible} 个可达` : "")
+    + ` · 按综合得分排序`
     + (state.provinces.length ? ` ｜ 范围：${state.provinces.join("、")}` : "")
     + (r.verdict && r.verdict.why ? ` ｜ AI复核：${r.verdict.why}` : "");
   grid.innerHTML = "";
@@ -269,9 +319,44 @@ function renderDestinations(r){
     card.querySelector(".pick-btn").onclick = () => runPlans(d.city);
     grid.appendChild(card);
   });
-  sec.classList.remove("hidden");
-  sec.scrollIntoView({behavior:"smooth"});
-  renderMap(r.origin, state.dests);
+
+  /* 查看更多：其余可达候选（规则评分序，紧凑卡片） */
+  const wrap = $("#moreWrap"); wrap.innerHTML = "";
+  const more = r.more || [];
+  if (more.length){
+    const total = r.total_feasible || (state.dests.length + more.length);
+    const btn = document.createElement("button");
+    btn.className = "btn ghost more-btn";
+    btn.innerHTML = `还有 ${more.length} 个可达目的地（共 ${total} 个满足条件） <b>展开 ↓</b>`;
+    const mg = document.createElement("div");
+    mg.className = "more-grid hidden";
+    more.forEach(d => {
+      const tr = d.transport_est || {};
+      const mc = document.createElement("div");
+      mc.className = "mini-card";
+      mc.innerHTML = `
+        <div class="mini-top"><b>${d.city}</b><i>${d.province} · ${Math.round(d.km)}km</i>
+          <span class="mini-score">${d.score}分</span></div>
+        ${(d.in_kb === false) ? `<div class="dest-tags"><span class="tag niche">小众</span>${(d.tags||[]).slice(0,2).map(t=>`<span class="tag">${t}</span>`).join("")}</div>` : ""}
+        <div class="mini-reason">${(d.reasons || []).slice(0,2).join("；")}</div>
+        <div class="mini-foot"><span>¥${d.rough_total} 估 · ${tr.desc || ""} ${tr.hours ?? ""}h</span>
+          <button class="pick-btn mini-pick">选它 →</button></div>`;
+      mc.querySelector(".mini-pick").onclick = () => runPlans(d.city);
+      mg.appendChild(mc);
+    });
+    btn.onclick = () => {
+      const hidden = mg.classList.toggle("hidden");
+      btn.querySelector("b").textContent = hidden ? "展开 ↓" : "收起 ↑";
+      if (!hidden) mg.scrollIntoView({behavior:"smooth", block:"nearest"});
+    };
+    wrap.appendChild(btn); wrap.appendChild(mg);
+  }
+
+  $("#traceReplayDest").innerHTML = $("#traceList").innerHTML;
+  $("#traceReplayDest").closest("details").querySelector("summary")
+    .textContent = `Agent 思考回放 · ${$("#traceList").children.length} 步`;
+  showView("dest");
+  renderMap(r.origin, state.dests, more);
 }
 
 function scoreRing(score){
@@ -282,7 +367,7 @@ function scoreRing(score){
 }
 
 /* ── 地图（Leaflet，失败静默降级） ── */
-function renderMap(origin, dests){
+function renderMap(origin, dests, more){
   const box = $("#mapBox");
   try{
     if (typeof L === "undefined") { box.style.display = "none"; return; }
@@ -295,6 +380,12 @@ function renderMap(origin, dests){
     L.circleMarker([origin.lat, origin.lng],
       {radius:9, color:"#e0654f", fillColor:"#e0654f", fillOpacity:.9})
       .addTo(map).bindTooltip(`出发 · ${origin.name}`, {permanent:true, direction:"top"});
+    (more || []).forEach(d => {           // 其余可达候选：灰色小点
+      if (d.lat == null || d.lng == null) return;
+      L.circleMarker([d.lat, d.lng],
+        {radius:4, color:"#9aa4ad", fillColor:"#9aa4ad", fillOpacity:.55, weight:1.5})
+        .addTo(map).bindTooltip(`${d.city} · ${d.score}分`).on("click", () => runPlans(d.city));
+    });
     dests.forEach(d => {
       L.circleMarker([d.lat, d.lng],
         {radius:7, color:"#0fa3a8", fillColor:"#0fa3a8", fillOpacity:.8, weight:2})
@@ -308,15 +399,16 @@ function renderMap(origin, dests){
 /* ── 阶段二：方案生成 ── */
 async function runPlans(dest){
   const params = {...collectParams(), dest};
-  $("#stagePlans").classList.add("hidden");
   beginTrace(`Agent → 正在研究「${dest}」`);
   try{
     const r = await streamPost("/api/agent/plans/stream", params, addTraceStep);
     endTrace();
     state.plans = r.plans; state.intel = r.intel; state.lastPlanResp = r;
+    state.guide = r.guide;
     $("#traceTitle").textContent = `Agent → 「${dest}」方案已就绪`;
     renderPlans(r);
-  }catch(e){ endTrace(); toast("方案生成失败：" + e.message); }
+  }catch(e){ endTrace(); showView(state.dests.length ? "dest" : "home");
+             toast("方案生成失败：" + e.message); }
 }
 
 function renderPlans(r){
@@ -353,15 +445,65 @@ function renderPlans(r){
         ${over ? `<div class="plan-over">超预算 ¥${p.budget.total - collectParams().budget}</div>` : ""}
         <div class="plan-cta">查看行程 ↗</div>
       </div>`;
-    card.onclick = () => openDrawer(p, r);
+    card.onclick = () => openPlan(i);
     list.appendChild(card);
   });
-  sec.classList.remove("hidden");
-  sec.scrollIntoView({behavior:"smooth"});
+
+  /* 详细攻略：多源交叉验证组装，放在方案列表最下方 */
+  $("#guideBox").innerHTML = guideHtml(r.guide);
+
+  $("#traceReplayPlans").innerHTML = $("#traceList").innerHTML;
+  $("#traceReplayPlans").closest("details").querySelector("summary")
+    .textContent = `Agent 思考回放 · ${$("#traceList").children.length} 步`;
+  showView("plans");
 }
 
-/* ── 方案详情抽屉 ── */
-function openDrawer(p, r){
+function guideHtml(g){
+  if (!g || !g.sections || !g.sections.length) return "";
+  return `<div class="guide">
+    <h3 class="guide-title">${esc(g.dest)} · 数据来源与参考
+      <small>方案由以下来源交叉验证组装：小红书笔记 · 去哪儿票价 · 高德POI · 12306</small></h3>
+    ${g.sections.map(sec => `
+      <div class="guide-sec">
+        <h4>${sec.icon || ""} ${esc(sec.title)}</h4>
+        <div class="guide-items">${sec.items.map(gItem).join("")}</div>
+      </div>`).join("")}
+  </div>`;
+}
+
+/* markdown-lite：###小节 / -列表 / **重点**（先整体转义再替换标记） */
+function mdLite(s){
+  if (!s) return "";
+  const bold = t => t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+  let html = "", inUl = false;
+  const closeUl = () => { if (inUl){ html += "</ul>"; inUl = false; } };
+  for (const ln of esc(s).split(/\n+/).map(x => x.trim()).filter(Boolean)){
+    if (ln.startsWith("###")){ closeUl(); html += `<h4>${bold(ln.replace(/^#+\s*/, ""))}</h4>`; }
+    else if (ln.startsWith("- ") || ln.startsWith("* ")){
+      if (!inUl){ html += "<ul>"; inUl = true; }
+      html += `<li>${bold(ln.slice(2))}</li>`;
+    } else { closeUl(); html += `<p>${bold(ln)}</p>`; }
+  }
+  closeUl();
+  return html;
+}
+
+function gItem(it){
+  const t = it.url
+    ? `<a href="${esc(it.url)}" target="_blank" rel="noopener">${esc(it.title)}</a>`
+    : `<b>${esc(it.title)}</b>`;
+  return `<div class="g-item"><div class="g-head">${t}${it.meta ? `<i>${esc(it.meta)}</i>` : ""}</div>
+    ${it.excerpt ? `<div class="g-ex">${esc(it.excerpt)}</div>` : ""}</div>`;
+}
+
+/* ── 方案详情（整页视图） ── */
+function openPlan(i){
+  state.planIdx = i;
+  renderPlanDetail(state.plans[i], state.lastPlanResp);
+  showView("plan");
+}
+
+function renderPlanDetail(p, r){
   const t = p.transport;
   const trainRows = (t.trains || []).map(tr => `
     <tr><td><b>${tr.code}</b></td><td>${tr.from}→${tr.to}</td>
@@ -387,7 +529,7 @@ function openDrawer(p, r){
   ];
   const maxB = Math.max(...rows.map(x => x[1]), 1);
 
-  $("#drawerBody").innerHTML = `
+  $("#detailBody").innerHTML = `
     <div class="d-title">${r.dest} · ${p.name}</div>
     <div class="d-sub">${p.desc} · ${p.pace}节奏 · ${r.origin.name}出发往返</div>
 
@@ -401,6 +543,9 @@ function openDrawer(p, r){
     </div>
 
     <div class="itin">${itin}</div>
+
+    ${p.guide ? `<div class="pguide"><h4>📖 本套详细攻略</h4>
+      <div class="pguide-body">${mdLite(p.guide)}</div></div>` : ""}
 
     <div class="budget-box">
       <h4>预算拆解（单人）</h4>
@@ -416,13 +561,9 @@ function openDrawer(p, r){
       ${(state.intel.tips || []).map(x => `<li>${x}</li>`).join("")}
       ${(state.intel.notes || []).map(x => `<li>${x}</li>`).join("")}
       ${(state.intel.web || []).slice(0,2).map(w => `<li>攻略参考：<a href="${w.url}" target="_blank" style="color:var(--teal-d)">${w.title}</a></li>`).join("")}
-    </ul></div>`;
-  $("#drawer").classList.add("open");
-  $("#drawerMask").classList.remove("hidden");
-}
-function closeDrawer(){
-  $("#drawer").classList.remove("open");
-  $("#drawerMask").classList.add("hidden");
+    </ul></div>
+
+    ${guideHtml(state.guide)}`;
 }
 
 init();

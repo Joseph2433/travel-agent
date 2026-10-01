@@ -21,6 +21,15 @@ FRONTEND = os.path.join(BASE, "frontend")
 
 app = FastAPI(title="旅图 · TravelAgent")
 
+# 拆分部署（前端 GitHub Pages + 后端独立主机）时允许跨域；
+# CORS_ORIGINS 逗号分隔，未配置则放开（无凭据请求，安全）
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in
+                   os.getenv("CORS_ORIGINS", "*").split(",")],
+    allow_methods=["*"], allow_headers=["*"])
+
 
 class RecommendReq(BaseModel):
     lat: float | None = None

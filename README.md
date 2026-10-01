@@ -46,9 +46,11 @@ TravelAgent  backend/agent.py        # 门面：一次请求 = 一次 LangGraph 
 **真 Agent 模式**（配 `LLM_API_KEY` 后）：模型自主决定调哪些工具、调几次——
 目的地推荐时它在**全国 372 城候选池**（可按用户圈定省份过滤）里扫描，
 对感兴趣的小众城市还能调 `get_city_intel` 查实况再推荐；
-行程规划时它自己查攻略摘要/天气/POI/12306往返车次，还能用 `search_pois`
-实时搜任意类别的景点/美食（带评分/参考价/地址），编排 3-5 套差异化方案
-（每天槽位、餐厅景点、档位系数都由它决定），推理与工具调用全程进 trace 回放。
+行程规划时它先搜小红书真实攻略笔记搭骨架，再查攻略摘要/天气/POI/12306往返车次、
+去哪儿真实票价交叉验证填充（`search_pois` 可实时搜任意类别景点/美食，带评分/参考价/
+地址），编排 3-5 套差异化方案（每天槽位、餐厅景点、档位系数都由它决定），
+并在方案页底部输出一份多源组装的**详细攻略**（笔记灵感/景点门票/风味/交通/避雷/参考来源），
+推理与工具调用全程进 trace 回放（独立页面可展开）。
 代码的职责只剩：**校验**（景点名必须是知识库条目或高德真实POI，防幻觉）
 和**算数**（票价/预算永不由模型生成）。模型失联/输出不合法时原地降级规则引擎。
 
@@ -113,7 +115,31 @@ cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
 
 ## 前端
 
-原生 HTML/CSS/JS 单页（`frontend/`）：极光渐变 Hero、玻璃拟态表单、
-**SSE 实时 Agent 思考时间线**（模型每次推理/调工具/观察即时上屏）、
-Leaflet 地图、目的地评分卡（AI首推徽标+点评）、
-方案详情抽屉（真实车次表 + 逐日行程时间轴 + 预算条形图）。
+原生 HTML/CSS/JS（`frontend/`）：整页路由（条件页 → 目的地页 → 方案页 → 详情页，
+支持浏览器前进后退）、极光渐变 Hero、玻璃拟态表单、**SSE 实时 Agent 思考时间线**
+（结果页可展开回放）、Leaflet 地图、目的地评分卡 + 「查看更多」候选列表、
+方案详情页（真实车次表 + 逐日行程时间轴 + **每套方案的详细攻略正文** + 预算条形图）
++ 页底数据来源与参考清单。
+
+## 部署（前端 GitHub Pages + 后端独立主机）
+
+GitHub Pages 只能跑静态文件，FastAPI 后端（SSE 流式 + 长耗时 Agent）需要单独的主机。
+
+**① 后端 → Render（免费档，推荐）**
+1. [render.com](https://render.com) → New → **Blueprint** → 选本仓库（`render.yaml` 已写好）
+2. 按提示填环境变量：`AMAP_KEY` / `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`
+   （可选 `BOCHA_API_KEY`；小红书云端模式填 `XHS_API_BASE=https://mcp.aredink.com/mcp`
+   + `XHS_API_TOKEN`）；`CORS_ORIGINS` 填 `https://<你的用户名>.github.io`
+3. 部署完记下后端地址，如 `https://travel-agent-xxxx.onrender.com`
+   - 也可选 Railway / Fly.io：根目录已附 `Procfile`，环境变量同上
+   - 免费档休眠冷启动约 30-60s；Agent 单次请求 1-3 分钟属正常
+
+**② 前端 → GitHub Pages**
+1. 仓库 Settings → Pages → Source 选 **GitHub Actions**（一次性）
+2. push 到 `main` 即触发 `.github/workflows/pages.yml`，自动发布 `frontend/`
+3. 站点地址：`https://<用户名>.github.io/<仓库名>/`
+
+**③ 把前端指向后端**
+- 改 `frontend/config.js` 里的 `window.API_BASE = "https://你的后端地址"` 再 push；或
+- 不改文件：访问 `https://<页地址>/?api=https://后端地址` 一次，地址会写进浏览器
+  localStorage，之后访问免带参（想换后端用 `?api=` 覆盖即可）

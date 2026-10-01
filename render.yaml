@@ -1,0 +1,29 @@
+# Render 一键部署蓝图（render.com → New → Blueprint → 选本仓库）
+# 免费档：无流量 15 分钟后休眠，首次请求冷启动约 30-60s
+services:
+  - type: web
+    name: travel-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --app-dir backend --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      # 以下变量在部署时到控制台填写（sync:false = 不写入仓库）
+      - key: AMAP_KEY          # 高德 Web 服务 key
+        sync: false
+      - key: LLM_API_KEY       # 大模型 key（OpenAI 兼容协议）
+        sync: false
+      - key: LLM_BASE_URL      # 如 https://api.deepseek.com
+        sync: false
+      - key: LLM_MODEL         # 如 deepseek-chat
+        sync: false
+      - key: BOCHA_API_KEY     # 可选，博查搜索
+        sync: false
+      - key: XHS_API_BASE      # 可选，云端模式填 https://mcp.aredink.com/mcp
+        sync: false
+      - key: XHS_API_TOKEN     # 可选，x-mcp token
+        sync: false
+      - key: CORS_ORIGINS      # 填你的 Pages 域名，如 https://<user>.github.io
+        sync: false

@@ -3,10 +3,13 @@
 【有 LLM key】模型是大脑 —— ReAct 循环自主调工具拿数据、推理、输出结构化决策；
               代码只做校验（名字必须来自知识库）与算术（预算/票价永不由模型生成）。
   推荐图  resolve → agent_rank(ReAct: scan/profile → 排序+点评+首推) → END
-  方案图  resolve → agent_plan(ReAct: profile/intel/车次/预算 → 3-5套行程) → assemble → END
+  方案图  resolve → guide_dive(嵌套ReAct子代理:小红书多角度深读→攻略摘要)
+               → agent_plan(ReAct: 摘要+profile/intel/车次/预算 → 3-5套行程)
+               → assemble → END
 【无 LLM key】固定流水线兜底：
   推荐图  resolve → scan → rank → END
-  方案图  resolve → fetch_intel → judge_rule → compose → END
+  方案图  resolve → fetch_intel(含确定性小红书深挖 xhs_collect)
+               → judge_rule → compose → END
 
 模型每次推理/工具调用/观察都会变成 trace 步，前端可回放完整思考过程。
 """
@@ -38,6 +41,7 @@ class S(TypedDict, total=False):
     intel: dict
     judged: dict
     guide: dict                     # 目的地详细攻略（多源交叉验证组装）
+    guide_intel: dict | None        # 小红书攻略深读摘要（GuideDigest.model_dump）
     judge_engine: str               # llm-agent | rule | rule-fallback
     agent_out: object               # LLM 结构化输出（PlansOut/RecOut 实例）
     result: dict                    # {plans, transport, km, resolved_mode}
@@ -71,6 +75,7 @@ def n_resolve(s: S):
 
 _rec_agent_g = None
 _plan_agent_g = None
+_dive_agent_g = None
 
 
 def _chat_model():
@@ -107,6 +112,16 @@ def _plan_agent():
     return _plan_agent_g
 
 
+def _dive_agent():
+    global _dive_agent_g
+    if _dive_agent_g is None:
+        from langgraph.prebuilt import create_react_agent
+        _dive_agent_g = create_react_agent(
+            _chat_model(), tools=__import__("agent_tools").DIVE_TOOLS,
+            prompt=DIVE_PROMPT)
+    return _dive_agent_g
+
+
 REC_PROMPT = """你是「旅图」旅行规划 Agent 的目的地决策大脑。
 
 工作方式：先用工具拿真实数据，推理决策，最后必须调用 submit_result 提交结论。
@@ -128,20 +143,46 @@ REC_PROMPT = """你是「旅图」旅行规划 Agent 的目的地决策大脑。
 
 硬约束：只推荐工具返回中 fits_budget=true 或略超预算(over_ratio≤1.3)的城市。"""
 
+DIVE_PROMPT = """你是「旅图」的攻略深读研究员——唯一任务是把小红书真实游客笔记挖成
+结构化攻略摘要，供下游行程编排使用。
+
+工作方式（总工具调用 ≤8 次，精打细算）：
+1) 多角度搜索（2-4 次 xhs_find_notes，每次换一个角度而不是换同义词）：
+   「X 旅游攻略」「X N日游 路线」（N=用户天数）「X 美食 必吃」「X 避雷 劝退」；
+   用户有偏好时加一轮专项（如「X 亲子游」「X citywalk」）。
+   sort_by 默认"最多点赞"，结果太旧可换"最新"补一轮。
+2) 深读：从结果里挑 2-4 篇最相关/最高赞的笔记调 xhs_read_note 拿正文摘录与
+   热评——优先读行程路线类和避雷类笔记，正文里的具体店名/路线顺序是金子。
+3) 核实：笔记里反复出现、你准备采信的店名/小众景点，用 search_pois 核实真实
+   存在后再写进摘要；核实失败的不要写。
+4) 用 submit_result 提交摘要，payload 结构：
+{"summary":"≤120字综合经验谈：这座城实际怎么玩最顺、什么节奏、什么气质",
+ "routes":["笔记里反复出现的真实路线安排，按半天/天粒度，每条≤40字",...≤4],
+ "must_go":["高频被点名的必去地，可带具体位置/时段",...≤6],
+ "eats":["具体到店名/品类的美食，带一句为什么",...≤6],
+ "pitfalls":["避雷/差评/排队坑",...≤5],
+ "booking":["预约/购票/排队/交通技巧",...≤4],
+ "notes":[{"title":"笔记标题","url":"链接","likes":"赞数","author":"作者",
+           "points":["这篇笔记里你采信的要点 1-3 条"]},...≤5]}
+
+硬约束：只写笔记里真实出现的信息，不编攻略；所有条目都是能直接照着做的干货，
+不要"注意保暖"式的空话。"""
+
 PLAN_PROMPT = """你是「旅图」旅行规划 Agent 的行程编排大脑。
 
 工作方式：严格按"攻略先行 → 多源验证 → 编排填充"的顺序调研，最后必须调用
 submit_result 提交结论。
 
-1) 攻略先行：优先调 search_xhs_notes 搜「目的地 旅游攻略」「目的地 N日游路线」
-   拿真实游客笔记作为攻略骨架（必去景点/必吃美食/避雷点/路线节奏）；需要深挖
-   店名或避雷细节时加 with_detail=true 拿正文摘录。小红书未配置时跳过，改看
-   get_city_intel 的网页攻略摘要。
+1) 攻略先行：用户消息若带「攻略深读」字段，那是前置深读子代理从小红书多篇
+   高赞笔记里提炼的真实游客经验（路线套路/高频必去/实测美食/避雷/预约技巧）——
+   直接拿它当攻略骨架，被点名的景点/店优先编排进对应槽位；缺该字段或需要补
+   特定主题时再调 search_xhs_notes 轻量补搜；都没有时看 get_city_intel 的
+   网页攻略摘要。
 2) 骨架验证：get_city_profile 看知识库景点/美食/贴士/消费档；get_city_intel 拿
    实时天气（weather实况 + forecast近4天逐日预报，行程落在预报窗口内的
    要在 notes/guide 里写清每日天气）、高德POI、去哪儿真实票价
    (scenic_qunar.ticket 是真实挂牌价)。
-   笔记里出现的店名/景点，先用 search_pois 核实真实存在再编进方案；
+   笔记/摘要里出现的店名/景点，先用 search_pois 核实真实存在再编进方案；
    需要特定类别（博物馆/夜市/古镇/亲子等）时用 search_pois 主动补充。
 3) 交通：出行方式为 train/auto 时调 query_trains 拿真实车次票价——
    用户给了出发日期时传 dep_date=出发日、ret_date=出发日+天数-1；
@@ -164,12 +205,13 @@ submit_result 提交结论。
            "food_factor":1.0,"days":[{"day":1,"title":"当日标题","items":[
            {"slot":"上午","type":"景点","name":"知识库中的精确名称"}]}],
            "guide":"本套方案的详细攻略正文(###小节/-列表/**重点**，300-600字)：
-                    路线怎么玩、门票怎么约、美食去哪吃、避雷提醒——
-                    只写刚才工具调研核实过的信息，不编造店名和数字"}],
+                    优先复述「攻略深读」里核实过的真实经验（路线节奏/点名店铺/
+                    避雷/预约技巧），再补你刚查到的票价与天气；
+                    没有深读摘要时才按通用经验写，不编造店名和数字"}],
  "notes":["出行提示3-5条，注明源自攻略还是实况"],
  "dropped":[{"name":"剔除景点名","reason":"理由"}]}
 
-硬约束：真实景点/美食名只能从工具数据中选，不要编造。"""
+硬约束：真实景点/美食名只能从工具数据或攻略深读摘要中选，不要编造。"""
 
 
 def _msg_trace(msgs):
@@ -538,15 +580,50 @@ def build_recommend():
 
 # --------------------------------------------- 方案图：LLM 自主编排 --------
 
+def n_guide_dive(s: S):
+    """嵌套攻略深读：独立 ReAct 子代理围绕目的地做多角度小红书挖掘，
+    产出结构化 GuideDigest——既喂给 agent_plan 当攻略骨架，也进 build_guide
+    成为「小红书深读」区块。小红书不可用/子代理失败均降级为空摘要继续。"""
+    req = s["req"]
+    if not apis.xhs_enabled():
+        return {"guide_intel": None, "trace": [
+            _t("search", "攻略深读", "小红书数据源未配置，跳过嵌套调研")]}
+    st = apis.xhs_login_status()
+    if st and st.get("logged_in") is False:
+        return {"guide_intel": None, "trace": [
+            _t("search", "攻略深读", "小红书未登录（xiaohongshu-mcp 扫码后启用），跳过")]}
+
+    user_msg = json.dumps({
+        "目的地": req["dest"].rstrip("市"), "天数": req["days"],
+        "出行风格": req.get("style") or "适中",
+        "偏好": req.get("prefs") or [], "出发日期": _date_ctx(req),
+    }, ensure_ascii=False)
+    msgs, err, steps = _run_react(_dive_agent(), user_msg)
+    out, ext_err = _extract_structured(msgs, schemas.GuideDigest)
+    if err or not out:
+        why = (f"调用失败：{str(err)[:60]}" if err
+               else f"摘要不合法（{ext_err}）")
+        steps.append(_t("search", "攻略深读", f"{why}，编排阶段继续"))
+        return {"guide_intel": None, "trace": steps}
+    digest = out.model_dump()
+    n_tips = sum(len(digest.get(k) or []) for k in
+                 ("routes", "must_go", "eats", "pitfalls", "booking"))
+    steps.append(_t("search", "攻略深读完成",
+                    f"采信 {len(digest.get('notes') or [])} 篇笔记 · "
+                    f"提炼 {n_tips} 条经验"))
+    return {"guide_intel": digest, "trace": steps}
+
+
 def n_agent_plan(s: S):
     """LLM Agent：自主调研目的地（画像/情报/车次/预算），输出 3-5 套行程。"""
     req, origin = s["req"], s["origin"]
-    user_msg = json.dumps({
-        "出发地": origin["name"], "目的地": req["dest"], "预算": req["budget"],
-        "天数": req["days"], "出行方式": req.get("transport", "auto"),
-        "出发日期": _date_ctx(req), "出行风格": req.get("style") or "适中",
-        "偏好": req.get("prefs") or [], "当前月份": datetime.now().month,
-    }, ensure_ascii=False)
+    msg = {"出发地": origin["name"], "目的地": req["dest"], "预算": req["budget"],
+           "天数": req["days"], "出行方式": req.get("transport", "auto"),
+           "出发日期": _date_ctx(req), "出行风格": req.get("style") or "适中",
+           "偏好": req.get("prefs") or [], "当前月份": datetime.now().month}
+    if s.get("guide_intel"):                     # 嵌套深读摘要 → 攻略骨架
+        msg["攻略深读"] = s["guide_intel"]
+    user_msg = json.dumps(msg, ensure_ascii=False)
 
     msgs, err, steps = _run_react(_plan_agent(), user_msg)
     tool_data = _collect_tool_data(msgs)
@@ -566,7 +643,8 @@ def n_agent_plan(s: S):
                                "resolved_mode": req.get("transport", "auto")},
                     "judge_engine": "rule-fallback", "tool_data": tool_data,
                     "trace": steps}
-        intel = tools.fetch_intel(None, req["dest"], date=req.get("date"))
+        intel = tools.fetch_intel(None, req["dest"], date=req.get("date"),
+                                  days=req["days"], prefs=req.get("prefs"))
         judged = tools.judge_intel(None, intel, req["days"],
                                    req.get("prefs") or [], date=req.get("date"))
         result = tools.compose_plans(None, origin, req["dest"], req["budget"],
@@ -577,7 +655,8 @@ def n_agent_plan(s: S):
         return {"intel": intel, "judged": judged, "result": result,
                 "guide": tools.build_guide(c, intel, judged,
                                            tool_data=tool_data,
-                                           transport=result.get("transport")),
+                                           transport=result.get("transport"),
+                                           digest=s.get("guide_intel")),
                 "judge_engine": "rule-fallback", "tool_data": tool_data,
                 "trace": steps + _compose_trace(result, req)}
 
@@ -647,7 +726,8 @@ def n_assemble(s: S):
         })
 
     if len(plans) < 3:                           # 方案不足 → 规则兜底（非知识库城市也可）
-        intel = tools.fetch_intel(None, req["dest"], date=req.get("date"))
+        intel = tools.fetch_intel(None, req["dest"], date=req.get("date"),
+                                  days=req["days"], prefs=req.get("prefs"))
         judged = tools.judge_intel(None, intel, req["days"],
                                    req.get("prefs") or [], date=req.get("date"))
         result = tools.compose_plans(None, origin, req["dest"], req["budget"],
@@ -658,13 +738,15 @@ def n_assemble(s: S):
         return {"intel": intel, "judged": judged, "result": result,
                 "guide": tools.build_guide(c, intel, judged,
                                            tool_data=tool_data,
-                                           transport=result.get("transport")),
+                                           transport=result.get("transport"),
+                                           digest=s.get("guide_intel")),
                 "judge_engine": "rule-fallback",
                 "trace": [_t("judge", "方案校验", "LLM 方案不足3套，转规则编排")
                           ] + _compose_trace(result, req)}
 
+    digest = s.get("guide_intel") or {}
     # 组装 intel（供前端情报条）：数据来自 ReAct 工具调用的真实返回
-    intel = _intel_from_tools(c, tool_data)
+    intel = _intel_from_tools(c, tool_data, digest=digest)
     if not intel.get("scenic_qunar"):          # 模型没查去哪儿 → 代码补拉兜底
         qs = apis.qunar_scenic(c["name"], 8)
         if qs:
@@ -678,10 +760,14 @@ def n_assemble(s: S):
     dropped = [{"name": d.name, "reason": (d.reason or "")[:30]}
                for d in (getattr(out, "dropped", None) or [])]
     notes = [str(n)[:60] for n in (getattr(out, "notes", None) or [])][:5]
+    for p in (digest.get("pitfalls") or [])[:2]:    # 深读避雷点进情报条/锦囊
+        notes.append(f"📕 {p}")
     notes += tools.date_notes(meta, tools.trip_forecast(intel, meta))
     notes += tools._base_notes(intel)
     judged = {"notes": notes, "dropped": dropped,
-              "tips": c["tips"], "foods": c["foods"][:5], "kept": []}
+              "tips": c["tips"], "foods": c["foods"][:5], "kept": [],
+              "xhs_eats": (digest.get("eats") or [])[:4],
+              "xhs_pitfalls": (digest.get("pitfalls") or [])[:4]}
     result = {"plans": plans[:5], "transport": transport, "km": km,
               "resolved_mode": mode}
     for pl in result["plans"]:
@@ -690,7 +776,7 @@ def n_assemble(s: S):
                 pl, dict(judged,
                          qunar_scenic=intel.get("scenic_qunar") or []))
     guide = tools.build_guide(c, intel, judged, tool_data=tool_data,
-                              transport=transport)
+                              transport=transport, digest=digest or None)
     return {"intel": intel, "judged": judged, "result": result,
             "guide": guide, "judge_engine": "llm-agent",
             "trace": [_t("judge", "LLM 编排完成",
@@ -866,10 +952,18 @@ def _map_item(it, att_map, food_map, poi_map=None, food_pool=None):
             "note": "", "cost": 40}
 
 
-def _intel_from_tools(c, tool_data):
-    """把 ReAct 工具返回还原成前端情报条需要的数据源标注。"""
+def _intel_from_tools(c, tool_data, digest=None):
+    """把 ReAct 工具返回还原成前端情报条需要的数据源标注。
+    digest: guide_dive 子代理产出的小红书深读摘要（有则标"小红书深读"并把
+    采信笔记并进攻略参考列表）。"""
     intel = {"city": c, "sources": ["本地知识库"], "weather": None,
              "web": None, "pois_scenic": None}
+
+    def _add_web(item):
+        if intel["web"] is None:
+            intel["web"] = []
+        intel["web"].append(item)
+
     td = _last_td(tool_data, "get_city_intel")
     if isinstance(td, dict):
         if td.get("weather"):
@@ -890,10 +984,18 @@ def _intel_from_tools(c, tool_data):
     if isinstance(xhs_td, dict) and xhs_td.get("notes"):
         intel["sources"].append("小红书")
         for n in xhs_td["notes"][:3]:           # 并进攻略参考列表，前端自动可点
-            (intel["web"] or intel.setdefault("web", [])).append({
-                "title": "小红书 · " + n["title"], "url": n.get("url") or "",
-                "snippet": f"赞{n.get('likes','0')} · @{n.get('author','')}"
-                           + (f"｜{n['excerpt'][:60]}…" if n.get("excerpt") else "")})
+            _add_web({"title": "小红书 · " + n["title"],
+                      "url": n.get("url") or "",
+                      "snippet": f"赞{n.get('likes','0')} · @{n.get('author','')}"
+                                 + (f"｜{n['excerpt'][:60]}…"
+                                    if n.get("excerpt") else "")})
+    if digest:                                   # 深读子代理的采信笔记
+        intel["sources"].append("小红书深读")
+        for n in (digest.get("notes") or [])[:3]:
+            _add_web({"title": "小红书深读 · " + (n.get("title") or "")[:30],
+                      "url": n.get("url") or "",
+                      "snippet": (" · ".join(n.get("points") or [])[:80]
+                                  or f"赞{n.get('likes','0')}")})
     if _last_td(tool_data, "query_trains"):
         intel["sources"].append("12306实时车次")
     return intel
@@ -911,9 +1013,11 @@ def _compose_trace(result, req):
 # 规则流水线节点（无 key 时使用）---------------------------------------------
 
 def n_fetch_intel(s: S):
-    intel = tools.fetch_intel(None, s["req"]["dest"], date=s["req"].get("date"))
+    req = s["req"]
+    intel = tools.fetch_intel(None, req["dest"], date=req.get("date"),
+                              days=req["days"], prefs=req.get("prefs"))
     return {"intel": intel,
-            "trace": [_t("search", f"搜索「{s['req']['dest']}」当地特色与攻略",
+            "trace": [_t("search", f"搜索「{req['dest']}」当地特色与攻略",
                          "数据来源：" + " + ".join(intel["sources"]))]}
 
 
@@ -945,12 +1049,13 @@ def n_compose(s: S):
 
 
 def _route_plan(s: S):
-    return "agent_plan" if llm.llm_available() else "fetch_intel"
+    return "guide_dive" if llm.llm_available() else "fetch_intel"
 
 
 def build_plan():
     g = StateGraph(S)
     g.add_node("resolve", n_resolve)
+    g.add_node("guide_dive", n_guide_dive)
     g.add_node("agent_plan", n_agent_plan)
     g.add_node("assemble", n_assemble)
     g.add_node("fetch_intel", n_fetch_intel)
@@ -958,8 +1063,9 @@ def build_plan():
     g.add_node("compose", n_compose)
     g.add_edge(START, "resolve")
     g.add_conditional_edges("resolve", _route_plan,
-                            {"agent_plan": "agent_plan",
+                            {"guide_dive": "guide_dive",
                              "fetch_intel": "fetch_intel"})
+    g.add_edge("guide_dive", "agent_plan")
     g.add_edge("agent_plan", "assemble")
     g.add_edge("assemble", END)
     g.add_edge("fetch_intel", "judge_rule")

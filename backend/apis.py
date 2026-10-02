@@ -749,8 +749,9 @@ def xhs_search_notes(keyword: str, sort_by: str = "最多点赞", limit: int = 6
         return {"notes": [], "error": str(e)[:100], "src": "xiaohongshu"}
 
 
-def xhs_feed_detail(feed_id: str, xsec_token: str = ""):
-    """笔记详情 → {title, desc, likes, hot_comments}。REST/MCP 双模式。"""
+def xhs_feed_detail(feed_id: str, xsec_token: str = "", desc_len: int = 400):
+    """笔记详情 → {title, desc, likes, hot_comments}。REST/MCP 双模式。
+    desc_len: 正文截取长度（深读子代理传更大值拿更多上下文）。"""
     if not xhs_enabled() or not feed_id:
         return None
     try:
@@ -765,9 +766,13 @@ def xhs_feed_detail(feed_id: str, xsec_token: str = ""):
                                         "load_all_comments": False},
                                   headers=_xhs_headers(), timeout=_XHS_TIMEOUT)
                 d = (r.json() or {}).get("data") or {}
+        # REST 层多包一层 {data:{feed_id, data:{note, comments}}} → 取里层
+        if isinstance(d.get("data"), dict) and "note" in d["data"]:
+            d = d["data"]
         note = d.get("note") or {}
         comments = ((d.get("comments") or {}).get("list")) or []
-        return {"title": note.get("title"), "desc": (note.get("desc") or "")[:400],
+        return {"title": note.get("title"),
+                "desc": (note.get("desc") or "")[:desc_len],
                 "likes": (note.get("interactInfo") or {}).get("likedCount"),
                 "hot_comments": [(c.get("content") or "")[:80]
                                  for c in comments[:3]]}

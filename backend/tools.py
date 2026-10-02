@@ -325,8 +325,9 @@ def rank_destinations(ctx, scanned, budget, days, prefs, meta=None):
 _WINTER_MARK = ("冰雪大世界", "雪博会", "冰雪嘉年华")
 
 
-def fetch_intel(ctx, city_name, date=None):
-    """目的地情报搜索：高德POI + 天气(+指定日期的逐日预报) + 网页攻略 + 本地知识库。"""
+def fetch_intel(ctx, city_name, date=None, days=0, prefs=None):
+    """目的地情报搜索：高德POI + 天气(+指定日期的逐日预报) + 网页攻略
+    + 本地知识库 + 小红书确定性深挖（xhs_collect，多角度搜+读正文热评）。"""
     c = get_city(city_name) or pool_profile(city_name)
     in_kb = any(x["name"] == c["name"] for x in load_cities())
     intel = {"city": c,
@@ -353,10 +354,54 @@ def fetch_intel(ctx, city_name, date=None):
     if web:
         intel["web"] = web; intel["sources"].append("网页搜索")
     if apis.xhs_enabled():
-        res = apis.xhs_search_notes(f"{c['name']} 旅游攻略", limit=4)
-        if res and res.get("notes"):
-            intel["xhs"] = res["notes"]; intel["sources"].append("小红书")
+        deep = xhs_collect(c["name"], days=days, prefs=prefs)
+        if deep and deep["notes"]:
+            intel["xhs"] = deep["notes"]
+            intel["sources"].append("小红书")
     return intel
+
+
+# 偏好 → 小红书专项搜索词（多角度换词不换义）
+_XHS_PREF_TOPICS = {"美食": "美食 必吃", "亲子": "亲子游", "人文": "人文 博物馆",
+                    "自然": "徒步 风景", "摄影": "拍照 打卡", "海滨": "海边 沙滩",
+                    "古镇": "古镇", "文艺": "citywalk 街区"}
+
+
+def xhs_collect(city_name, days=0, prefs=None, max_queries=3, detail_top=2):
+    """确定性小红书深挖（无 LLM 时也给攻略带真实笔记内容）：
+    多角度搜索 → 按 feed_id 去重合并 → 高赞前 detail_top 篇读正文/热评。
+    返回 {queries, notes} 或 None；每次搜索串行（xiaohongshu-mcp 单实例）。"""
+    if not apis.xhs_enabled():
+        return None
+    st = apis.xhs_login_status()
+    if st and st.get("logged_in") is False:
+        return None
+    queries = [f"{city_name} 旅游攻略"]
+    queries.append(f"{city_name} {days}日游 路线" if days
+                   else f"{city_name} 美食 避雷")
+    pref_q = next((_XHS_PREF_TOPICS[p] for p in (prefs or [])
+                   if p in _XHS_PREF_TOPICS), None)
+    if pref_q:
+        queries.append(f"{city_name} {pref_q}")
+    pool, seen = [], set()
+    used_q = []
+    for q in queries[:max_queries]:
+        res = apis.xhs_search_notes(q, limit=5)
+        if not res or res.get("error") or not res.get("notes"):
+            continue
+        used_q.append(q)
+        for n in res["notes"]:
+            fid = n.get("feed_id") or n.get("title")
+            if fid and fid not in seen:
+                seen.add(fid)
+                pool.append(n)
+    if not pool:
+        return None
+    for n in pool[:detail_top]:                 # 高赞前 N 篇读正文/热评
+        d = apis.xhs_feed_detail(n.get("feed_id"), n.get("xsec_token"))
+        if d:
+            n["excerpt"], n["hot_comments"] = d["desc"], d["hot_comments"]
+    return {"queries": used_q, "notes": pool[:8]}
 
 
 def _poi_attractions(intel, cap):
@@ -923,14 +968,38 @@ def _day_title(d, days, picked):
 
 # ----------------------------------------------------------- 详细攻略 ----
 
-def build_guide(c, intel, judged, tool_data=None, transport=None):
-    """组装「目的地详细攻略」：小红书笔记骨架 → 去哪儿票价 → 美食 → 贴士 → 来源。
-    全部内容来自工具/接口真实返回，代码只做取舍与去重，不生成文本。
+def build_guide(c, intel, judged, tool_data=None, transport=None, digest=None):
+    """组装「目的地详细攻略」：小红书深读摘要 → 笔记灵感 → 去哪儿票价 → 美食
+    → 贴士 → 来源。全部内容来自工具/接口真实返回，代码只做取舍与去重，
+    不生成文本。digest = guide_dive 子代理的 GuideDigest.model_dump()。
     item 结构统一为 {title, meta, url, excerpt}（后端字段，前端负责排版）。"""
     sections = []
 
-    # ① 攻略灵感：小红书真实笔记（LLM路径从 tool_data 收，规则路径从 intel 直收）
+    # ⓪ 小红书深读：嵌套子代理提炼的真实游客经验（summary/路线/必去/美食/避雷/技巧）
+    if digest:
+        deep = []
+        if digest.get("summary"):
+            deep.append({"title": "综合经验谈", "meta": "多篇高赞笔记提炼",
+                         "excerpt": digest["summary"][:180]})
+        for label, key in (("高频必去", "must_go"), ("路线参考", "routes"),
+                           ("美食实测", "eats"), ("预约/技巧", "booking"),
+                           ("避雷", "pitfalls")):
+            for x in (digest.get(key) or [])[:4]:
+                t = str(x).strip()
+                if t:
+                    deep.append({"title": t[:46], "meta": label})
+        if deep:
+            sections.append({"icon": "📕", "title": "小红书深读 · 真实游客经验",
+                             "items": deep[:14]})
+
+    # ① 攻略灵感：小红书真实笔记（深读采信笔记优先 + LLM路径 tool_data +
+    #   规则路径 intel 直收）
     notes = []
+    for n in (digest or {}).get("notes") or []:      # 深读采信笔记（带提炼要点）
+        notes.append({"title": n.get("title"), "likes": n.get("likes"),
+                      "collects": "", "author": n.get("author"),
+                      "url": n.get("url") or "",
+                      "excerpt": " · ".join(n.get("points") or [])})
     for td in (tool_data or {}).get("search_xhs_notes") or []:
         if isinstance(td, dict):
             notes.extend(td.get("notes") or [])
@@ -1076,6 +1145,16 @@ def build_plan_guide(plan, judged=None):
             lines.append(f"- **{i['name']}**："
                          + (f"{cost} · " if cost else "")
                          + (i.get("note") or "当地特色")[:40])
+
+    # 小红书深读摘要（嵌套子代理产出）：实测美食 + 避雷，兜底攻略也有真料
+    xhs_e, xhs_p = (judged.get("xhs_eats") or [],
+                    judged.get("xhs_pitfalls") or [])
+    if xhs_e or xhs_p:
+        lines.append("### 小红书实测")
+        for t in xhs_e[:4]:
+            lines.append(f"- 🍜 {t}")
+        for t in xhs_p[:4]:
+            lines.append(f"- ⚠️ {t}")
 
     tips = []
     for x in (judged.get("tips") or []) + (judged.get("notes") or []):

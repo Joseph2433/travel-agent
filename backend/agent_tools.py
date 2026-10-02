@@ -152,6 +152,35 @@ def search_xhs_notes(city: str, topic: str = "旅游攻略",
 
 
 @tool
+def xhs_find_notes(keyword: str, sort_by: str = "最多点赞", limit: int = 8):
+    """按任意关键词搜小红书笔记（攻略深读子代理专用）：
+    返回标题/作者/点赞/收藏/feed_id/xsec_token/链接。
+    换角度搜索比换同义词有效：'X 旅游攻略' / 'X 3日游 路线' / 'X 美食 必吃' /
+    'X 避雷 劝退' / 'X 亲子游' / 'X citywalk' 等；
+    sort_by: 综合|最新|最多点赞|最多收藏（结果太旧时换"最新"）。"""
+    if not apis.xhs_enabled():
+        return _j({"error": "小红书数据源未配置"})
+    res = apis.xhs_search_notes(keyword, sort_by=sort_by, limit=limit)
+    if not res or res.get("error"):
+        return _j({"error": f"搜索失败：{(res or {}).get('error') or '服务不可达'}",
+                   "keyword": keyword})
+    return _j({"keyword": keyword, "notes": res["notes"],
+               "tip": "挑最相关/最高赞的 1-2 篇用 xhs_read_note 读正文与热评"})
+
+
+@tool
+def xhs_read_note(feed_id: str, xsec_token: str = "", title: str = ""):
+    """读取指定小红书笔记的正文摘录与热门评论（深挖店名/路线细节/避雷用）。
+    feed_id/xsec_token 取自 xhs_find_notes 返回；title 填笔记标题便于对照。"""
+    d = apis.xhs_feed_detail(feed_id, xsec_token, desc_len=900)
+    if not d:
+        return _j({"error": "笔记详情读取失败", "feed_id": feed_id})
+    return _j({"feed_id": feed_id, "title": d.get("title") or title,
+               "desc": d.get("desc"), "likes": d.get("likes"),
+               "hot_comments": d.get("hot_comments") or []})
+
+
+@tool
 def travel_trends(boards: list = None, count: int = 10):
     """拉取各平台实时热搜榜（微博/知乎/抖音/小红书/头条），免登录免费。
     用于发现正在爆的目的地/网红玩法/文旅热点（如"XX麻辣烫""XX草原"），
@@ -235,3 +264,5 @@ REC_TOOLS = [scan_destinations, get_city_profile, get_city_intel,
 PLAN_TOOLS = [get_city_profile, get_city_intel, search_pois, search_xhs_notes,
               travel_trends, query_trains, estimate_transport, calc_budget,
               submit_result]
+# 攻略深读子代理：只挖小红书 + 核实POI，不碰编排/预算工具
+DIVE_TOOLS = [xhs_find_notes, xhs_read_note, search_pois, submit_result]

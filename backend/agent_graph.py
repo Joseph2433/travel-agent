@@ -1078,9 +1078,10 @@ def _resolve_transport(origin, c, req, tool_data):
                  "back": f"{est['desc']} 约{est.get('hours')}h返程",
                  "trains": []}, km, mode)
 
-    ob = min(fo["trains"], key=lambda t: t.get("dep") or "99:99")   # 最早去程
-    bk = (max(ro["trains"], key=lambda t: t.get("dep") or "")
-          if ro and ro.get("trains") else None)                     # 最晚回程
+    style = req.get("style") or "适中"
+    ob = tools._pick_outbound(fo["trains"], style)      # 白天前段最早去程
+    bk = (tools._pick_return(ro["trains"], style)
+          if ro and ro.get("trains") else None)          # 午后-傍晚最晚回程
     cost = ob.get("二等座") or (bk or {}).get("二等座") or est["cost"]
     return ({"mode": "train", "src": "12306", "hours": ob["hours"],
              "cost": round(cost),

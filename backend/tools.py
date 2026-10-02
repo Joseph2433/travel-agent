@@ -583,9 +583,12 @@ def _close_hour(open_hours):
 
 
 def _item_rank(d, it):
-    """日内排序键：(槽位序, 闭园约束) —— 同槽位内有闭园时间的景点排前面。"""
+    """日内排序键：(槽位序, 闭园约束) —— 同槽位内有闭园时间的景点排前面；
+    「全天」大项目紧跟早餐之后，别被挤到傍晚。"""
     if it.get("type") == "交通":
         return (9, 0) if "返程" in (it.get("name") or "") else (-1, 0)
+    if it.get("slot") == "全天":
+        return (0.6, 0)
     rank = _SLOT_ORDER.get(it.get("slot") or "", 4)
     # 有闭园约束的景点 → 同槽位内排前；夜间可去的项目/其他类型靠后
     night_ok = it.get("type") != "景点" or _night_ok(
@@ -697,6 +700,20 @@ def assign_times(days, style="适中", city=None):
         for it in items:
             name = it.get("name") or ""
             if it.get("type") == "交通" and it.get("_dep") is not None:
+                if "返程" in name and deadline is not None:
+                    gap = deadline - cur          # 截止前大空档 → 补"去车站"项
+                    if gap > 1.0:
+                        final.append({"slot": "留白", "type": "休闲",
+                                      "time": f"{_hm(cur)}–{_hm(deadline)}",
+                                      "name": "前往车站 · 候车机动",
+                                      "note": "提前到站安检候车；时间充裕也可改排机动备选",
+                                      "cost": 0, "_float": True})
+                        float_n += 1
+                    it["note"] = ((it.get("note") or "")
+                                  + f"｜{_hm(deadline)}前到站候车")
+                else:
+                    it["note"] = ((it.get("note") or "")
+                                  + f"｜建议{_hm(it['_dep'] - 0.75)}前到站候车")
                 it["time"] = f"{_hm(it['_dep'])}–{_hm(it['_arr'])}"
                 it["slot"] = ("晚上" if it["_dep"] >= 19 else
                               "下午" if it["_dep"] >= 12 else "上午")
@@ -710,9 +727,10 @@ def assign_times(days, style="适中", city=None):
                 loc, inter = None, cfg["gap"]
             else:
                 loc = it.get("loc") or geocode_poi(cname, name)
-                inter = cfg["gap"]
                 if prev_loc and loc:
-                    inter = max(inter, _transit_h(prev_loc, loc))
+                    inter = max(cfg["gap"], _transit_h(prev_loc, loc))
+                else:
+                    inter = max(cfg["gap"], 0.6)  # 缺坐标兜底：按较远换场估
             cur += inter
             ear = _SLOT_EARLIEST.get(it.get("slot") or "")
             if ear is not None:
@@ -883,20 +901,53 @@ def apply_llm_judge(intel, days, prefs, llm_out):
             "qunar_scenic": intel.get("scenic_qunar") or []}
 
 
-def _real_rail(origin_name, dest_name, dep_date=None, ret_date=None):
-    """查12306真实车次，选去程(最早出发)/回程(最晚出发)各一班。
+def _dep_h(t):
+    """车次 dep 'HH:MM' → 小时浮点；缺时刻返回 None。"""
+    try:
+        h, m = (t.get("dep") or "").split(":")[:2]
+        return int(h) + int(m) / 60
+    except (ValueError, AttributeError):
+        return None
+
+
+def _pick_outbound(trains, style="适中"):
+    """去程选班：优先白天前段窗口内最早一班（特种兵 5:30-9:30 / 其余 7:00-10:30）
+    ——不凌晨赶车也不浪费白天；窗口无车退而求全表最早。"""
+    lo, hi = (5.5, 9.5) if style == "特种兵" else (7.0, 10.5)
+
+    def key(t):
+        d = _dep_h(t)
+        return (0, d) if d is not None and lo <= d <= hi else (1, d or 99)
+    return min(trains, key=key)
+
+
+def _pick_return(trains, style="适中"):
+    """回程选班：优先午后-傍晚窗口内最晚一班（特种兵 16:00-21:30 / 其余
+    15:00-19:30）——白天不浪费、到家不太晚；窗口无车退而求全表最晚。"""
+    lo, hi = (16.0, 21.5) if style == "特种兵" else (15.0, 19.5)
+
+    def key(t):
+        d = _dep_h(t)
+        return (0, -(d or 0)) if d is not None and lo <= d <= hi \
+            else (1, -(d or 0))
+    return min(trains, key=key)
+
+
+def _real_rail(origin_name, dest_name, dep_date=None, ret_date=None,
+               style="适中"):
+    """查12306真实车次，选去程(白天前段最早)/回程(午后-傍晚最晚)各一班。
     dep_date/ret_date: YYYY-MM-DD，None 用接口默认（预售期第7天）。"""
     data = apis.query_trains(origin_name, dest_name, dep_date)
     if not data or not data["trains"]:
         return None
     hs = [t for t in data["trains"] if t["kind"] == "高铁"]
     trains = hs or data["trains"]
-    outbound = min(trains, key=lambda t: t.get("dep") or "99:99")  # 最早出发
+    outbound = _pick_outbound(trains, style)      # 白天前段最早去程
     ret = outbound
     back = apis.query_trains(dest_name, origin_name, ret_date)   # 回程反方向查
     if back and back["trains"]:
         hb = [t for t in back["trains"] if t["kind"] == "高铁"] or back["trains"]
-        ret = max(hb, key=lambda t: t.get("dep") or "")            # 最晚返程
+        ret = _pick_return(hb, style)             # 午后-傍晚最晚返程
     price = apis.train_price(outbound) or {}
     return {"date": data["date"], "ret_date": (back or {}).get("date"),
             "all": trains,
@@ -934,7 +985,7 @@ def compose_plans(ctx, origin, dest_name, budget, days, transport, prefs,
     else:
         trans = geo.estimate_transport(km, transport, c)
         resolved_mode = trans["mode"]
-        rail = _real_rail(origin["name"], c["name"], dep_d, ret_d) \
+        rail = _real_rail(origin["name"], c["name"], dep_d, ret_d, style) \
             if resolved_mode == "train" else None
 
     if local:
@@ -1069,6 +1120,10 @@ def _build_plan(theme, city, origin, attractions, foods, days,
     big = [a for a in atts if a["hours"] >= 7]   # 需整天的景点
     normal = [a for a in atts if a["hours"] < 7]
 
+    # 返程班次时刻：最后一天按返程早晚决定排程密度（晚班次别留大空档）
+    rtm = _trans_times(transport.get("back") or "")
+    ret_dep = rtm[0] if rtm else None
+
     # 抵达日：交通耗时短 → 早到，第一天可当整天排满
     try:
         arr_h = float(transport.get("hours") or 0)
@@ -1091,8 +1146,10 @@ def _build_plan(theme, city, origin, attractions, foods, days,
                           "hours": transport.get("hours")})
         pool = normal
 
-        # 挑选当日景点；特种兵多加一个、休闲随意减一个；早到首日按中间日算
-        full_day = 1 < d < days or (d == 1 and full_first)
+        # 挑选当日景点；特种兵多加一个、休闲随意减一个；早到首日按中间日算；
+        # 返程班次 ≥15:00 的末日也按中间日加密，别留半天空档候车
+        full_day = (1 < d < days or (d == 1 and full_first)
+                    or (d == days and ret_dep is not None and ret_dep >= 15.0))
         take = max(1, (density if full_day else 1) + cfg["take"])
         picked = []
         # 中间日优先安排"需一整天"的大景点（每个行程最多2个大景点日）
@@ -1120,8 +1177,9 @@ def _build_plan(theme, city, origin, attractions, foods, days,
         base = 0 if (d > 1 or full_first) else 1   # 晚到首日景点从下午排起
         for i, a in enumerate(picked):
             slot = "全天" if a["hours"] >= 7 else slot_order[min(i + base, 2)]
-            # 开放时间校验：夜间不开放的景点不占晚间档
-            if slot == "晚上" and not _night_ok(a["n"] + a.get("desc", "")):
+            # 开放时间校验：夜间不开放的景点不占晚间档；≥5h 的大项目也不进
+            if slot == "晚上" and (a["hours"] >= 5
+                                   or not _night_ok(a["n"] + a.get("desc", ""))):
                 slot = "下午"
             real = _qunar_price(a["n"], qunar)
             items.append({"slot": slot, "type": "景点", "name": a["n"],
@@ -1138,7 +1196,7 @@ def _build_plan(theme, city, origin, attractions, foods, days,
                     return f
             return None
 
-        f1 = _pick_food(d - 1)
+        f1 = _pick_food(d - 1) if d < days else None   # 末日不排午餐位，白耗配额
         f2 = _pick_food(d)
         if d < days and f1:
             items.append({"slot": "午餐", "type": "美食", "name": f1["n"],

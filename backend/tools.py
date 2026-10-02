@@ -140,6 +140,68 @@ def scan_destinations(ctx, origin, budget, days, transport, prefs,
     return out
 
 
+LOCAL_KM = 160          # 本地游候选半径：本城 + 周边一日/两日可达圈
+_LOCAL_KIND_KM = 40     # ≤40km 视作市内（本城城区/片区），之外算周边
+
+
+def scan_local(ctx, origin, budget, days, transport, prefs):
+    """本地游候选扫描：本城本身（市内玩法）+ 本城下辖区县（高德行政区，
+    无 key 时跳过）+ 周边 ≤160km 的地级市。
+    行结构与 scan_destinations 同构，另加 kind（市内|周边）；
+    交通/预算用本地尺度估算，市内候选 one_way≈0。"""
+    kb = {c["name"]: c for c in load_cities()}
+    cands, seen = [], {origin["name"]}
+    cands.append({"name": origin["name"], "province": origin.get("province", ""),
+                  "lat": origin["lat"], "lng": origin["lng"], "km": 0.0})
+    for r in apis.district_cities(origin["name"]) or []:   # 本城下辖区县
+        name = r.get("name")
+        if not name or name in seen or r.get("lat") is None or r.get("lng") is None:
+            continue
+        km = geo.haversine_km(origin["lat"], origin["lng"], r["lat"], r["lng"])
+        if km > LOCAL_KM:
+            continue
+        seen.add(name)
+        cands.append({"name": name, "province": origin.get("province", ""),
+                      "lat": r["lat"], "lng": r["lng"], "km": km})
+    pool = apis.all_prefecture_cities() or [
+        {"name": c["name"], "province": c["province"],
+         "lat": c["lat"], "lng": c["lng"]} for c in load_cities()]
+    for row in pool:
+        name = row["name"]
+        if name in seen or row.get("lat") is None or row.get("lng") is None:
+            continue
+        km = geo.haversine_km(origin["lat"], origin["lng"], row["lat"], row["lng"])
+        if km > LOCAL_KM:
+            continue
+        seen.add(name)
+        cands.append({"name": name, "province": row["province"],
+                      "lat": row["lat"], "lng": row["lng"], "km": km})
+
+    out = []
+    for row in cands:
+        name, km = row["name"], row["km"]
+        c = kb.get(name) or pool_profile(name, row["province"],
+                                         row["lat"], row["lng"])
+        est = geo.estimate_local(km, transport)
+        if not est.get("feasible"):
+            out.append({"city": name, "feasible": False,
+                        "reason": est.get("reason"), "km": km})
+            continue
+        tickets = sum(a["ticket"] for a in c["attractions"] if a["must"] >= 4)
+        rough = geo.trip_budget(c, days, est["cost"], nights=0 if km <= 3 else None,
+                                attraction_ticket_sum=tickets * 0.6)
+        out.append({
+            "city": name, "province": row["province"],
+            "lat": row["lat"], "lng": row["lng"],
+            "feasible": True, "km": km, "in_kb": name in kb,
+            "kind": "市内" if km <= _LOCAL_KIND_KM else "周边",
+            "transport_est": est, "rough_total": rough["total"],
+            "fits_budget": rough["total"] <= budget,
+            "over_ratio": round(rough["total"] / max(budget, 1), 2),
+        })
+    return out
+
+
 _trend_cache = {"ts": 0.0, "names": set()}
 # 高频词误伤名单：这些地级市名同时是常用词，命中热榜不算"热议"
 _TREND_DENY = {"长治", "朝阳", "灯塔", "前进", "向阳", "东风", "共和",
@@ -322,10 +384,29 @@ def rank_destinations(ctx, scanned, budget, days, prefs, meta=None):
     return scored
 
 
+def rank_local(ctx, scanned, budget, days, prefs, meta=None):
+    """本地游候选排序：复用 rank_destinations 的多因子打分（距离效率项
+    对近距候选天然生效），补透传 kind 并给市内/近郊一点新鲜感加权。"""
+    ranked = rank_destinations(ctx, scanned, budget, days, prefs, meta=meta)
+    by_city = {s["city"]: s for s in scanned if s.get("feasible")}
+    for r in ranked:
+        s = by_city.get(r["city"]) or {}
+        r["kind"] = s.get("kind") or ("市内" if r["km"] <= _LOCAL_KIND_KM
+                                     else "周边")
+        if r["kind"] == "市内":
+            r["score"] = min(100, r["score"] + 4)
+            r["reasons"] = ["本城/城区 · 说走就走"] + r["reasons"][:3]
+        else:
+            r["score"] = min(100, r["score"] + 2)
+            r["reasons"] = ["周边一日圈 · 当日可往返"] + r["reasons"][:3]
+    ranked.sort(key=lambda x: -x["score"])
+    return ranked
+
+
 _WINTER_MARK = ("冰雪大世界", "雪博会", "冰雪嘉年华")
 
 
-def fetch_intel(ctx, city_name, date=None, days=0, prefs=None):
+def fetch_intel(ctx, city_name, date=None, days=0, prefs=None, local=False):
     """目的地情报搜索：高德POI + 天气(+指定日期的逐日预报) + 网页攻略
     + 本地知识库 + 小红书确定性深挖（xhs_collect，多角度搜+读正文热评）。"""
     c = get_city(city_name) or pool_profile(city_name)
@@ -354,7 +435,7 @@ def fetch_intel(ctx, city_name, date=None, days=0, prefs=None):
     if web:
         intel["web"] = web; intel["sources"].append("网页搜索")
     if apis.xhs_enabled():
-        deep = xhs_collect(c["name"], days=days, prefs=prefs)
+        deep = xhs_collect(c["name"], days=days, prefs=prefs, local=local)
         if deep and deep["notes"]:
             intel["xhs"] = deep["notes"]
             intel["sources"].append("小红书")
@@ -364,21 +445,28 @@ def fetch_intel(ctx, city_name, date=None, days=0, prefs=None):
 # 偏好 → 小红书专项搜索词（多角度换词不换义）
 _XHS_PREF_TOPICS = {"美食": "美食 必吃", "亲子": "亲子游", "人文": "人文 博物馆",
                     "自然": "徒步 风景", "摄影": "拍照 打卡", "海滨": "海边 沙滩",
-                    "古镇": "古镇", "文艺": "citywalk 街区"}
+                    "古镇": "古镇", "文艺": "citywalk 街区",
+                    "城市漫步": "citywalk 街区", "遛娃": "遛娃 亲子",
+                    "看展": "看展 博物馆", "露营": "露营 野餐"}
 
 
-def xhs_collect(city_name, days=0, prefs=None, max_queries=3, detail_top=2):
+def xhs_collect(city_name, days=0, prefs=None, max_queries=3, detail_top=2,
+                local=False):
     """确定性小红书深挖（无 LLM 时也给攻略带真实笔记内容）：
     多角度搜索 → 按 feed_id 去重合并 → 高赞前 detail_top 篇读正文/热评。
-    返回 {queries, notes} 或 None；每次搜索串行（xiaohongshu-mcp 单实例）。"""
+    返回 {queries, notes} 或 None；每次搜索串行（xiaohongshu-mcp 单实例）。
+    local=True 时查询角度换成本地人周末玩法。"""
     if not apis.xhs_enabled():
         return None
     st = apis.xhs_login_status()
     if st and st.get("logged_in") is False:
         return None
-    queries = [f"{city_name} 旅游攻略"]
-    queries.append(f"{city_name} {days}日游 路线" if days
-                   else f"{city_name} 美食 避雷")
+    if local:
+        queries = [f"{city_name} 周末去哪玩", f"{city_name} citywalk 街区"]
+    else:
+        queries = [f"{city_name} 旅游攻略"]
+        queries.append(f"{city_name} {days}日游 路线" if days
+                       else f"{city_name} 美食 避雷")
     pref_q = next((_XHS_PREF_TOPICS[p] for p in (prefs or [])
                    if p in _XHS_PREF_TOPICS), None)
     if pref_q:
@@ -475,8 +563,12 @@ _SCENIC_CLOSE = 17.75                     # 无开放时间数据时的保守闭
 
 
 def _night_ok(text, open_hours=None):
-    """景点能否排晚间：名字/简介含开放街区特征，或已知闭园时间 ≥19:30。"""
-    if any(w in (text or "") for w in _NIGHT_WORDS):
+    """景点能否排晚间：名字/简介含开放街区特征，或已知闭园时间 ≥19:30。
+    先剔除地址段——"塔山街道鲁迅中路241号"里的"街/巷"会误命中街区特征。"""
+    segs = [s for s in re.split(r"\s*[·｜|]\s*", text or "")
+            if not re.search(r"\d+\s*号|街道|大道", s)]
+    text = " ".join(segs)
+    if any(w in text for w in _NIGHT_WORDS):
         return True
     close = _close_hour(open_hours)
     return close is not None and close >= 19.5
@@ -546,26 +638,74 @@ def _hm(h):
     return f"{m // 60:02d}:{m % 60:02d}"
 
 
+def _trans_times(note):
+    """从交通项 note「D2289 上海09:28→绍兴10:37」解析 (dep_h, arr_h)；
+    估算文案（无时刻）返回 None。"""
+    m = re.search(r"(\d{1,2})[:：](\d{2})→.*?(\d{1,2})[:：](\d{2})",
+                  note or "")
+    if not m:
+        return None
+    dep = int(m.group(1)) + int(m.group(2)) / 60
+    arr = int(m.group(3)) + int(m.group(4)) / 60
+    if arr < dep:
+        arr += 24                                   # 跨零点到达
+    return dep, arr
+
+
+_REST_ITEMS = (("自由放空 / 回酒店休整", "行程留白，自由活动"),
+               ("街头闲逛 / 咖啡时光", "行程留白，附近随意逛逛"),
+               ("水边散步 / 随手拍", "行程留白，慢节奏放空"),
+               ("本地市集 / 消食溜达", "行程留白，体验日常"))
+
+
+def _float_item(pre, till, idx=0):
+    """大段空档的留白缓冲项；idx 轮转不同叫法，同方案内不出现同文案。"""
+    nm, note = _REST_ITEMS[idx % len(_REST_ITEMS)]
+    return {"slot": "留白", "type": "休闲", "time": f"{_hm(pre)}–{_hm(till)}",
+            "name": nm, "note": note, "cost": 0, "_float": True}
+
+
 def assign_times(days, style="适中", city=None):
     """给每个行程项打大致时间范围（it["time"]="HH:MM–HH:MM"）：
     当天项目先按槽位规范顺序重排（去程最前、返程最后、午餐在午后前），
     再从「出门时刻」顺推；相邻项目间按坐标估通勤（酒店按市中心），
-    餐/夜类槽位有最早开始约束；风格决定起床早晚/吃饭快慢。"""
+    餐/夜类槽位有最早开始约束；风格决定起床早晚/吃饭快慢。
+    真实班次（12306）按票面时刻锚定：去程落地时刻=后续行程起点，
+    返程出发时刻-50min=当天硬截止；非夜间型景点排不进闭园前 → 降「机动备选」；
+    日程空档 >2h 自动补留白项。"""
     cfg = _style_cfg(style)
     cname = (city or {}).get("name") or ""
     try:
         center = (float(city["lat"]), float(city["lng"]))
     except (TypeError, KeyError, ValueError):
         center = None
+    float_n = 0                                 # 留白项计数：轮转不同叫法
     for d in days or []:
         items = d.get("items") or []
         items.sort(key=lambda it: _item_rank(d, it))
-        cur = cfg["start"]
-        prev_loc = center                         # 酒店按市中心估
+        deadline = None
+        for it in items:                            # 真实班次锚点
+            if it.get("type") != "交通":
+                continue
+            tm = _trans_times(it.get("note") or "")
+            if tm:
+                it["_dep"], it["_arr"] = tm
+                if "返程" in (it.get("name") or ""):
+                    deadline = tm[0] - 0.85         # 提前 ~50min 到站
+        cur, prev_loc = cfg["start"], center        # 酒店按市中心估
+        final = []
         for it in items:
             name = it.get("name") or ""
+            if it.get("type") == "交通" and it.get("_dep") is not None:
+                it["time"] = f"{_hm(it['_dep'])}–{_hm(it['_arr'])}"
+                it["slot"] = ("晚上" if it["_dep"] >= 19 else
+                              "下午" if it["_dep"] >= 12 else "上午")
+                if "返程" not in name:              # 去程落地=当天行程起点
+                    cur, prev_loc = it["_arr"] + 0.3, center
+                final.append(it)
+                continue
             if it.get("type") == "交通" and "返程" not in name:
-                loc, inter = center, 0.0          # 去程落地=市中心，不占通勤
+                loc, inter = center, 0.0
             elif it.get("type") == "交通":
                 loc, inter = None, cfg["gap"]
             else:
@@ -576,6 +716,10 @@ def assign_times(days, style="适中", city=None):
             cur += inter
             ear = _SLOT_EARLIEST.get(it.get("slot") or "")
             if ear is not None:
+                wait = ear + cfg["shift"] - cur
+                if wait > 2.0:                      # 空档>2h → 补留白项
+                    final.append(_float_item(cur, ear + cfg["shift"], float_n))
+                    float_n += 1
                 cur = max(cur, ear + cfg["shift"])
             dur = 0.0
             if it.get("type") == "美食":
@@ -587,19 +731,36 @@ def assign_times(days, style="适中", city=None):
                     dur = 0.0
                 if dur <= 0:
                     dur = _DUR_DEF.get(it.get("type"), 1.5)
+            # 闭园校验：非夜间型景点排不进闭园前
+            if it.get("type") == "景点" and not _night_ok(
+                    (it.get("name") or "") + (it.get("note") or "")):
+                m = re.search(r"开放([\d:：\-–—至 ]+)", it.get("note") or "")
+                close = (_close_hour(m.group(1)) if m else None) or _SCENIC_CLOSE
+                if cur + dur > close:
+                    if close - cur >= 1.0:          # 还能赶个尾：压缩时长
+                        dur = close - cur
+                        it["note"] = ((it.get("note") or "")
+                                      + " ⏰闭园前赶尾，建议提前入园")
+                    else:                           # 闭园前不足1h → 机动备选
+                        it["slot"], it["time"] = "机动", "机动"
+                        it["note"] = ((it.get("note") or "")
+                                      + " ⏰排进时段已过闭园，机动备选")
+                        final.append(it)
+                        continue
+            if (deadline and it.get("type") != "交通"
+                    and cur + dur > deadline):      # 赶不上返程班次 → 机动备选
+                it["slot"], it["time"] = "机动", "机动"
+                it["note"] = ((it.get("note") or "")
+                              + " ⏰赶不上返程班次，机动备选")
+                final.append(it)
+                continue
             it["time"] = (f"{_hm(cur)}–{_hm(cur + dur)}"
                           if cur < 23.9 else "深夜后")
-            # 开放时间校验：非夜间型景点排到 ~17:45 之后 → 标注意见
-            if it.get("type") == "景点" and cur + dur > _SCENIC_CLOSE:
-                m = re.search(r"开放([\d:：\-–—至 ]+)", it.get("note") or "")
-                if not _night_ok((it.get("name") or "")
-                                 + (it.get("note") or ""),
-                                 m.group(1) if m else None):
-                    it["note"] = ((it.get("note") or "")
-                                  + " ⏰此时段或已过闭园时间，建议提前")
             cur += dur
             if loc:
                 prev_loc = loc
+            final.append(it)
+        d["items"] = final
     return days
 
 
@@ -745,21 +906,40 @@ def _real_rail(origin_name, dest_name, dep_date=None, ret_date=None):
 
 
 def compose_plans(ctx, origin, dest_name, budget, days, transport, prefs,
-                  judged, date=None, style="适中"):
+                  judged, date=None, style="适中", local=False):
     """编排 3-5 套差异化行程方案。date: 出发日 YYYY-MM-DD（可选）；
-    style: 特种兵|适中|休闲随意——影响每日密度与时间轴。"""
+    style: 特种兵|适中|休闲随意——影响每日密度与时间轴。
+    local=True 走本地游语义：市内目的地无大交通/不住宿，周边为短途接驳。"""
     c = get_city(dest_name) or pool_profile(dest_name)
     km = geo.haversine_km(origin["lat"], origin["lng"], c["lat"], c["lng"])
-
-    trans = geo.estimate_transport(km, transport, c)
-    resolved_mode = trans["mode"]
+    is_home = bool(local) and (km <= 3 or origin["name"] == c["name"])
     meta = date_meta(date, days)
     dep_d = meta["date"] if meta else None      # 去程=出发日
     ret_d = meta["ret"] if meta else None       # 回程=行程最后一天
-    rail = _real_rail(origin["name"], c["name"], dep_d, ret_d) \
-        if resolved_mode == "train" else None
 
-    if rail and resolved_mode == "train":
+    if local:
+        est = geo.estimate_local(km, transport)
+        resolved_mode = "local" if is_home else est["mode"]
+        transport_info = {
+            "mode": resolved_mode, "src": "model",
+            "hours": 0 if is_home else est.get("hours"),
+            "cost": 0 if is_home else est.get("cost", 0),
+            "outbound": "本城出行 · 市内交通" if is_home
+                        else f"{est['desc']} 约{est.get('hours')}h",
+            "back": "" if is_home
+                    else f"{est['desc']} 约{est.get('hours')}h · 傍晚返程",
+            "trains": [],
+        }
+        rail = None
+    else:
+        trans = geo.estimate_transport(km, transport, c)
+        resolved_mode = trans["mode"]
+        rail = _real_rail(origin["name"], c["name"], dep_d, ret_d) \
+            if resolved_mode == "train" else None
+
+    if local:
+        pass                                    # transport_info 已在本地分支成型
+    elif rail and resolved_mode == "train":
         one_way = rail["price_2nd"] or trans["cost"]
         transport_info = {
             "mode": "train", "src": "12306", "hours": rail["outbound"]["hours"],
@@ -788,10 +968,13 @@ def compose_plans(ctx, origin, dest_name, budget, days, transport, prefs,
 
     themes = _plan_themes(days, c)
     plans = []
-    for t in themes[:5]:
-        plan = _build_plan(t, c, origin, kept, foods, days,
+    for ti, t in enumerate(themes[:5]):
+        # 候选池按主题轮转起始偏移：各套方案从不同子集起排，避免套娃式重复
+        pool = (kept[ti:] + kept[:ti]) if kept and ti else list(kept)
+        plan = _build_plan(t, c, origin, pool, foods, days,
                            transport_info, budget, prefs,
-                           qunar=judged.get("qunar_scenic"), style=style)
+                           qunar=judged.get("qunar_scenic"), style=style,
+                           local=local, is_home=is_home, food_shift=ti)
         plan["guide"] = build_plan_guide(plan, judged)
         plans.append(plan)
     return {"plans": plans, "transport": transport_info, "km": km,
@@ -847,13 +1030,40 @@ def _qunar_price(name, scenic):
     return best["ticket"] if best else None
 
 
+def _norm_spot(nm):
+    """景点判重归一化：去括号注释与通用后缀（景区/公园/博物馆等），
+    让「鲁迅故里」与「鲁迅故里景区」这类同源名字判到一处。"""
+    s = re.sub(r"[（(][^)）]*[)）]", "", nm or "").strip()
+    s = re.sub(r"(风景名胜区|风景区|旅游区|度假区|历史街区|景区|街区"
+               r"|公园|博物馆|纪念馆)$", "", s).strip()
+    return s or (nm or "").strip()
+
+
+def _name_dup(nm, seen):
+    """归一化后命中 seen，或与某个已用名归一化后互为子串（均≥2字）也算重复，
+    如「沈园」与「沈园之夜」。"""
+    k = _norm_spot(nm)
+    if len(k) < 2:
+        return False
+    if k in seen:
+        return True
+    return any(len(s) >= 2 and (k in s or s in k) for s in seen)
+
+
 def _build_plan(theme, city, origin, attractions, foods, days,
-                transport, budget, prefs, qunar=None, style="适中"):
-    """把景点/美食排进 days 天的日程槽位。style 影响每日密度与时间轴。"""
+                transport, budget, prefs, qunar=None, style="适中",
+                local=False, is_home=False, food_shift=0):
+    """把景点/美食排进 days 天的日程槽位。style 影响每日密度与时间轴。
+    local=True 为本地游：is_home（本城）不排接驳交通、晚上回家不住宿；
+    周边目的地首尾仍有短途去程/返程。
+    food_shift: 饭店循环起始偏移——各主题错开取餐，避免各方案吃同几家。"""
     cfg = _style_cfg(style)
     density = theme["density"]
     atts = list(attractions)
     used = []
+    used_names = set()
+    used_foods = set()
+    rest_n = 0                                   # 度假留白项轮转计数
     itinerary = []
 
     big = [a for a in atts if a["hours"] >= 7]   # 需整天的景点
@@ -868,20 +1078,18 @@ def _build_plan(theme, city, origin, attractions, foods, days,
 
     for d in range(1, days + 1):
         items = []
-        if d == 1:
+        if d == 1 and not is_home:
             items.append({"slot": "上午", "type": "交通",
                           "name": f"{origin['name']} → {city['name']}",
                           "note": transport["outbound"], "cost": transport["cost"],
                           "hours": transport.get("hours")})
-            pool = normal
-        elif d == days:
-            items.append({"slot": "下午", "type": "交通",
+        if not is_home and d == days and (local or d > 1):
+            # 本地一日游当天也要排返程；跨城原逻辑返程只在最后一天(d>1)
+            items.append({"slot": "傍晚" if local else "下午", "type": "交通",
                           "name": f"{city['name']} → {origin['name']} 返程",
                           "note": transport["back"], "cost": transport["cost"],
                           "hours": transport.get("hours")})
-            pool = normal
-        else:
-            pool = normal
+        pool = normal
 
         # 挑选当日景点；特种兵多加一个、休闲随意减一个；早到首日按中间日算
         full_day = 1 < d < days or (d == 1 and full_first)
@@ -892,16 +1100,20 @@ def _build_plan(theme, city, origin, attractions, foods, days,
         if theme["id"] == "deep":
             big_cap = max(1, big_cap - 0)
         if 1 < d < days and not theme.get("resort"):
-            big_left = [a for a in big if a not in used]
-            big_used_so_far = sum(1 for a in big if a in used)
+            big_left = [a for a in big
+                        if not _name_dup(a["n"], used_names)]
+            big_used_so_far = sum(1 for a in big
+                                  if _norm_spot(a["n"]) in used_names)
             if big_left and big_used_so_far < big_cap:
                 picked.append(big_left[0]); used.append(big_left[0])
+                used_names.add(_norm_spot(big_left[0]["n"]))
         for a in list(pool):
             if len(picked) >= take:
                 break
-            if a in used:
+            if _name_dup(a["n"], used_names):
                 continue
             picked.append(a); used.append(a)
+            used_names.add(_norm_spot(a["n"]))
             pool.remove(a)
 
         slot_order = ["上午", "下午", "晚上"]
@@ -916,9 +1128,18 @@ def _build_plan(theme, city, origin, attractions, foods, days,
                           "note": a["desc"], "loc": a.get("loc"),
                           "cost": real if real is not None else a["ticket"],
                           "hours": a["hours"]})
-        # 餐饮槽位：午/晚；每餐附不同价位备选
-        f1 = foods[(d - 1) % len(foods)] if foods else None
-        f2 = foods[(d) % len(foods)] if foods and len(foods) > 1 else None
+        # 餐饮槽位：午/晚；每餐附不同价位备选。
+        # 同名饭店本方案内不重复——顺延取未用过的，都用过就跳过该餐位
+        def _pick_food(start):
+            for k in range(len(foods)):
+                f = foods[(start + food_shift + k) % len(foods)]
+                if not _name_dup(f["n"], used_foods):
+                    used_foods.add(_norm_spot(f["n"]))
+                    return f
+            return None
+
+        f1 = _pick_food(d - 1)
+        f2 = _pick_food(d)
         if d < days and f1:
             items.append({"slot": "午餐", "type": "美食", "name": f1["n"],
                           "note": f1["d"], "cost": f1["p"], "loc": f1.get("loc"),
@@ -929,15 +1150,19 @@ def _build_plan(theme, city, origin, attractions, foods, days,
                           "note": f2["d"], "cost": f2["p"], "loc": f2.get("loc"),
                           "options": food_options(foods, f2["n"])})
         if theme.get("resort") and 1 < d < days:
-            items.append({"slot": "午后", "type": "休闲", "name": "酒店休憩/咖啡时光",
-                          "note": "留白时间，度假节奏", "cost": 40})
+            nm, note = _REST_ITEMS[rest_n % len(_REST_ITEMS)]
+            items.append({"slot": "午后", "type": "休闲", "name": nm,
+                          "note": note, "cost": 40})
+            rest_n += 1
         if theme["id"] == "foodie" and 1 < d < days and foods:
-            extra = foods[(d + 1) % len(foods)]
-            items.append({"slot": "下午茶/夜宵", "type": "美食", "name": extra["n"],
-                          "note": extra["d"], "cost": extra["p"],
-                          "loc": extra.get("loc"),
-                          "options": food_options(foods, extra["n"])})
-        itinerary.append({"day": d, "title": _day_title(d, days, picked),
+            extra = _pick_food(d + 1)
+            if extra:
+                items.append({"slot": "下午茶/夜宵", "type": "美食",
+                              "name": extra["n"], "note": extra["d"],
+                              "cost": extra["p"], "loc": extra.get("loc"),
+                              "options": food_options(foods, extra["n"])})
+        itinerary.append({"day": d, "title": _day_title(d, days, picked,
+                                                        local=local),
                           "items": items})
 
     assign_times(itinerary, style, city)
@@ -946,7 +1171,8 @@ def _build_plan(theme, city, origin, attractions, foods, days,
                    else a["ticket"]) for a in used)
     b = geo.trip_budget(city, days, transport["cost"],
                         hotel_factor=theme["hf"], food_factor=theme["ff"],
-                        attraction_ticket_sum=tickets)
+                        attraction_ticket_sum=tickets,
+                        nights=0 if is_home else None)
     over = b["total"] > budget
     return {
         "id": theme["id"], "name": theme["name"], "desc": theme["desc"],
@@ -956,22 +1182,27 @@ def _build_plan(theme, city, origin, attractions, foods, days,
     }
 
 
-def _day_title(d, days, picked):
-    if d == 1:
-        return "抵达 · 初印象"
-    if d == days:
+def _day_title(d, days, picked, local=False):
+    if not local:
+        if d == 1:
+            return "抵达 · 初印象"
+        if d == days:
+            return "收尾 · 返程"
+    elif days > 1 and d == days:
         return "收尾 · 返程"
     if picked:
         return picked[0]["n"].split("-")[0].split("(")[0][:8] + " 一线"
-    return "自由探索"
+    return "开逛 · 自由探索" if local else "自由探索"
 
 
 # ----------------------------------------------------------- 详细攻略 ----
 
-def build_guide(c, intel, judged, tool_data=None, transport=None, digest=None):
+def build_guide(c, intel, judged, tool_data=None, transport=None, digest=None,
+                local=False):
     """组装「目的地详细攻略」：小红书深读摘要 → 笔记灵感 → 去哪儿票价 → 美食
     → 贴士 → 来源。全部内容来自工具/接口真实返回，代码只做取舍与去重，
     不生成文本。digest = guide_dive 子代理的 GuideDigest.model_dump()。
+    local=True 时交通小节改成本地接驳口径。
     item 结构统一为 {title, meta, url, excerpt}（后端字段，前端负责排版）。"""
     sections = []
 
@@ -1047,19 +1278,26 @@ def build_guide(c, intel, judged, tool_data=None, transport=None, digest=None):
         sections.append({"icon": "🍜", "title": "本地风味 · 特色与热门店",
                          "items": food_items[:8]})
 
-    # ④ 大交通：12306 真实车次或估算
+    # ④ 交通：跨城=12306 真实车次或估算；本地=市内出行或短途接驳
     if transport and transport.get("outbound"):
-        items = [{"title": transport["outbound"], "meta": "去程"},
-                 {"title": transport["back"], "meta": "回程"}]
-        for tr in (transport.get("trains") or [])[:4]:
-            seat = (tr.get("seats") or {}).get("二等座")
-            items.append({"title": f"{tr['code']}　{tr['from']}→{tr['to']}",
-                          "meta": f"{tr['dep']}–{tr['arr']} · {tr['hours']}h"
-                                  + (f" · 二等座{seat}" if seat else "")})
-        sections.append({"icon": "🚄",
-                         "title": "大交通 · " + ("12306 实时余票"
-                                 if transport.get("src") == "12306" else "估算参考"),
-                         "items": items})
+        if transport.get("mode") == "local":
+            sections.append({"icon": "🚇", "title": "市内出行",
+                             "items": [{"title": transport["outbound"],
+                                        "meta": "本城范围"}]})
+        else:
+            items = [{"title": transport["outbound"], "meta": "去程"},
+                     {"title": transport["back"], "meta": "回程"}]
+            for tr in (transport.get("trains") or [])[:4]:
+                seat = (tr.get("seats") or {}).get("二等座")
+                items.append({"title": f"{tr['code']}　{tr['from']}→{tr['to']}",
+                              "meta": f"{tr['dep']}–{tr['arr']} · {tr['hours']}h"
+                                      + (f" · 二等座{seat}" if seat else "")})
+            sections.append({"icon": "🚄" if not local else "🚗",
+                             "title": ("短途接驳" if local else "大交通") + " · " +
+                                      ("12306 实时余票"
+                                       if transport.get("src") == "12306"
+                                       else "估算参考"),
+                             "items": items})
 
     # ⑤ 贴士与避雷：知识库贴士 + 引擎提示 + 笔记热评摘录
     tips = []

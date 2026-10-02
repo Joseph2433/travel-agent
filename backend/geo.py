@@ -8,6 +8,13 @@ TRANSPORT_MODES = {
     "drive":  {"label": "自驾"},
 }
 
+# 本地游出行方式：市内/近郊尺度，不再有火车飞机
+LOCAL_MODES = {
+    "transit": {"label": "公共交通"},
+    "drive":   {"label": "自驾/打车"},
+    "bike":    {"label": "骑行/步行"},
+}
+
 
 def haversine_km(lat1, lng1, lat2, lng2) -> float:
     R = 6371.0
@@ -76,11 +83,51 @@ def estimate_transport(km: float, mode: str, city: dict = None):
     return {"mode": mode, "feasible": False, "reason": "未知出行方式"}
 
 
+def estimate_local(km: float, mode: str):
+    """本地游出行估算（单程）：transit 公交地铁/大巴 | drive 自驾打车 |
+    bike 骑行步行。km 为直线公里；auto/空按 transit 处理。"""
+    if mode in (None, "", "auto"):
+        mode = "transit"
+
+    if mode == "bike":
+        if km > 30:
+            return {"mode": "bike", "feasible": False,
+                    "reason": "超出骑行/步行的舒适半径(30km)"}
+        return {"mode": "bike", "feasible": True,
+                "hours": round(max(0.2, km / 14), 1), "cost": 2,
+                "desc": "骑行/步行"}
+
+    if mode == "drive":
+        if km > 300:
+            return {"mode": "drive", "feasible": False,
+                    "reason": "超出舒适近游半径(300km)"}
+        road = _road_km(km)
+        hours = road / 65 + 0.2 if km > 5 else km / 30 + 0.1   # 市内低速
+        cost = road * 0.55 + (road * 0.4 if road > 40 else 0)  # 短途基本无高速费
+        return {"mode": "drive", "feasible": True,
+                "hours": round(hours, 1), "cost": round(cost),
+                "desc": f"自驾约{round(road)}km"}
+
+    if mode == "transit":
+        if km > 200:
+            return {"mode": "transit", "feasible": False,
+                    "reason": "超出公共交通近游半径(200km)"}
+        if km <= 15:
+            hours, cost, desc = 0.3 + km / 25, 2 + km * 0.2, "市内公交/地铁"
+        else:
+            hours, cost, desc = km / 55 + 0.5, 8 + km * 0.4, "公共交通(大巴/城铁)"
+        return {"mode": "transit", "feasible": True,
+                "hours": round(hours, 1), "cost": round(cost), "desc": desc}
+
+    return {"mode": mode, "feasible": False, "reason": "未知本地出行方式"}
+
+
 def trip_budget(dest: dict, days: int, transport_cost_one_way: float,
                 hotel_factor: float = 1.0, food_factor: float = 1.0,
-                attraction_ticket_sum: float = 0):
-    """组装一份行程的总预算（单人）。"""
-    nights = max(days - 1, 0)
+                attraction_ticket_sum: float = 0, nights: int = None):
+    """组装一份行程的总预算（单人）。nights 可显式指定住宿晚数
+    （本地游住家里传 0），缺省为 天数-1。"""
+    nights = max(days - 1, 0) if nights is None else max(int(nights), 0)
     hotel = dest["hotelPerNight"] * nights * hotel_factor
     food = dest["foodPerDay"] * days * food_factor
     local = dest["localPerDay"] * days

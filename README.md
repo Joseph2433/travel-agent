@@ -1,9 +1,16 @@
 # 旅图 · TravelAgent
 
-一个 Agent 驱动的智能旅行规划应用：根据**当前定位、预算、出行天数、出行方式**
-先圈出可达范围（全国 372 个地级市，可再按省份筛选），再由 Agent 推荐目的地、
-搜索当地情报、判断取舍，最终生成 **3-5 套完整出游方案**（交通往返 +
-每日行程 + 吃喝玩乐 + 预算拆解）。小众城市同样可推荐/可规划。
+一个 Agent 驱动的智能出行规划应用，两种模式：
+
+- **本地游（默认）**：给本地人推本地出行攻略——候选是本城及城区片区 +
+  周边 ≤160km 的区县/城镇，按 1-2 天近游编排（市内无大交通、默认不住宿），
+  出行方式为公共交通/自驾打车/骑行步行。
+- **出远门**：根据**当前定位、预算、出行天数、出行方式**
+  先圈出可达范围（全国 372 个地级市，可再按省份筛选），再由 Agent 推荐目的地、
+  搜索当地情报、判断取舍，最终生成 **3-5 套完整出游方案**（交通往返 +
+  每日行程 + 吃喝玩乐 + 预算拆解）。小众城市同样可推荐/可规划。
+
+前端表单顶部切换模式；`?mode=local` / `?mode=trip` 可直达分享。
 
 ## 架构
 
@@ -19,6 +26,8 @@ TravelAgent  backend/agent.py        # 门面：一次请求 = 一次 LangGraph 
    ▼  agent_graph.py                  # StateGraph 编排 + trace 采集
    │    有key: resolve → agent_*(ReAct循环: think→tool→observe→…) → assemble → END
    │    无key: resolve → scan/fetch_intel → rank/judge_rule → compose → END
+   │    （req.local=true 时全程走本地分支：scan_local 候选池 +
+   │     本地编排提示词 + 无大交通/住宿的预算口径）
    │
    ├─► llm.py         ── OpenAI兼容协议(Kimi/DeepSeek/OpenAI)  需 LLM_API_KEY
    ├─► agent_tools.py ── 暴露给模型的 @tool：scan_destinations / get_city_profile
@@ -122,6 +131,10 @@ cp .env.example .env   # 然后填入你的 key；.env 已在 .gitignore 中
 | POST | /api/agent/plans | 阶段二：搜索+判断+生成 3-5 套方案（可指定任意目的地） |
 | POST | /api/agent/destinations/stream | 同上，SSE 流式：逐步推 trace 事件 |
 | POST | /api/agent/plans/stream | 同上，SSE 流式 |
+
+请求体加 `"local": true` 即进入本地游模式：候选池变为本城 +
+下辖区县 + 周边 ≤160km 城镇（`transport` 取值 `transit`/`drive`/`bike`），
+方案不含往返大交通，本城目的地住宿项为 0。
 
 ### 账号鉴权（可选启用）
 

@@ -15,6 +15,7 @@
 """
 import json
 import operator
+import random
 import time
 import uuid
 from datetime import datetime
@@ -57,7 +58,8 @@ def _t(icon, title, detail=""):
 
 def _mode_label(m):
     return {"auto": "不限", "train": "高铁/火车", "flight": "飞机",
-            "drive": "自驾"}.get(m, m)
+            "drive": "自驾", "transit": "公共交通", "bike": "骑行/步行",
+            "local": "市内出行"}.get(m, m)
 
 
 # ------------------------------------------------------------- 公共节点 ----
@@ -76,6 +78,8 @@ def n_resolve(s: S):
 _rec_agent_g = None
 _plan_agent_g = None
 _dive_agent_g = None
+_rec_local_g = None
+_plan_local_g = None
 
 
 def _chat_model():
@@ -122,6 +126,26 @@ def _dive_agent():
     return _dive_agent_g
 
 
+def _rec_local_agent():
+    global _rec_local_g
+    if _rec_local_g is None:
+        from langgraph.prebuilt import create_react_agent
+        _rec_local_g = create_react_agent(
+            _chat_model(), tools=__import__("agent_tools").LOCAL_REC_TOOLS,
+            prompt=LOCAL_REC_PROMPT)
+    return _rec_local_g
+
+
+def _plan_local_agent():
+    global _plan_local_g
+    if _plan_local_g is None:
+        from langgraph.prebuilt import create_react_agent
+        _plan_local_g = create_react_agent(
+            _chat_model(), tools=__import__("agent_tools").PLAN_TOOLS,
+            prompt=LOCAL_PLAN_PROMPT)
+    return _plan_local_g
+
+
 REC_PROMPT = """你是「旅图」旅行规划 Agent 的目的地决策大脑。
 
 工作方式：先用工具拿真实数据，推理决策，最后必须调用 submit_result 提交结论。
@@ -150,6 +174,8 @@ DIVE_PROMPT = """你是「旅图」的攻略深读研究员——唯一任务是
 1) 多角度搜索（2-4 次 xhs_find_notes，每次换一个角度而不是换同义词）：
    「X 旅游攻略」「X N日游 路线」（N=用户天数）「X 美食 必吃」「X 避雷 劝退」；
    用户有偏好时加一轮专项（如「X 亲子游」「X citywalk」）。
+   若为本地游场景，角度换成「X 周末去哪玩」「X citywalk」「X 本地人 美食」
+   「X 周边游」。
    sort_by 默认"最多点赞"，结果太旧可换"最新"补一轮。
 2) 深读：从结果里挑 2-4 篇最相关/最高赞的笔记调 xhs_read_note 拿正文摘录与
    热评——优先读行程路线类和避雷类笔记，正文里的具体店名/路线顺序是金子。
@@ -157,9 +183,11 @@ DIVE_PROMPT = """你是「旅图」的攻略深读研究员——唯一任务是
    存在后再写进摘要；核实失败的不要写。
 4) 用 submit_result 提交摘要，payload 结构：
 {"summary":"≤120字综合经验谈：这座城实际怎么玩最顺、什么节奏、什么气质",
- "routes":["笔记里反复出现的真实路线安排，按半天/天粒度，每条≤40字",...≤4],
- "must_go":["高频被点名的必去地，可带具体位置/时段",...≤6],
- "eats":["具体到店名/品类的美食，带一句为什么",...≤6],
+ "routes":["彼此差异化的真实路线骨架——不同空间走向/主题（如古城citywalk线/
+           城外山水线/扫街美食线），不要同一条路的改写版，每条≤40字",...≤4],
+ "must_go":["候选池：高频必去+值得去的备选（含古城内外选项），给下游编排
+            做差异化抽取用，别只堆最热门那条线",...6-10个],
+ "eats":["具体到店名/品类的美食，带一句为什么",...≤8],
  "pitfalls":["避雷/差评/排队坑",...≤5],
  "booking":["预约/购票/排队/交通技巧",...≤4],
  "notes":[{"title":"笔记标题","url":"链接","likes":"赞数","author":"作者",
@@ -191,6 +219,10 @@ submit_result 提交结论。
 4) 编排 3-5 套差异化方案（主题如：经典全景/寻味美食/深度慢游/精华快闪/舒适度假，
    可按目的地特点自由命名）：
    - 每套 days 数量 = 用户天数；每天排 景点/美食/休闲 槽位（上午/下午/晚上/全天/午餐/晚餐）
+   - 差异化硬约束：各套方案从「攻略深读」候选池（must_go/eats/routes）和实时
+     POI 里抽**不同子集**——同一景点最多出现在一半方案里，最高频的 top1 只留给
+     主打方案；各套的空间走向/主题要错开（古城citywalk / 城外山水 / 扫街寻味 /
+     精华快闪…），不要拿同一条路线换个名字当两套方案
    - 出行风格：特种兵式=早出晚归高密度（可加早餐/夜宵档）；休闲随意式=少排点、
      午间留白、睡到自然醒；适中=常规节奏
    - 景点名可来自知识库 attractions 或 get_city_intel/search_pois 返回的高德POI名称；
@@ -210,6 +242,75 @@ submit_result 提交结论。
                     没有深读摘要时才按通用经验写，不编造店名和数字"}],
  "notes":["出行提示3-5条，注明源自攻略还是实况"],
  "dropped":[{"name":"剔除景点名","reason":"理由"}]}
+
+硬约束：真实景点/美食名只能从工具数据或攻略深读摘要中选，不要编造。"""
+
+LOCAL_REC_PROMPT = """你是「旅图」的本地周末出逃策划师——用户不是游客，是住在「所在城市」的
+本地人，想打发 1-2 天闲暇。任务是推荐本市内玩法和周边近游去处。
+
+工作方式：先用工具拿真实数据，推理决策，最后必须调用 submit_result 提交结论。
+1) 调 scan_local 获取候选：kind="市内" 是本城及城区片区（无大交通、无住宿，
+   日常可达）；kind="周边" 是 ≤160km 的区县/邻城（一日或两日往返）。
+2) 对感兴趣的去处：知识库城调 get_city_profile 看景点/美食/佳季；
+   小众区县可改调 get_city_intel 看实时POI密度/天气/攻略热度再判断；
+   需要验证某类玩法有没有得玩（夜市/古镇/露营/亲子/看展）时调 search_pois；
+   还可调 travel_trends 看正在热议的本地玩法。
+3) 本地视角的取舍标准：本地人要新鲜感——本城推荐要挖出"值得专门去"的
+   主题玩法（街区漫步/山野/市集/美食片区），而不是日常逛街；周边重
+   当日可往返的轻松度；临近周末/假期时周边目的地权重更高；
+   当前月份 vs 佳季、偏好命中、热榜热度同样考虑。
+
+最后用 submit_result 提交，payload 结构：
+{"ranking":[{"city":"候选名(必须来自工具返回)","score":0-100整数,
+ "comment":"≤25字点评"},...3-6条],
+ "pick":"首推候选(必须在ranking中)","why":"≤40字理由"}
+
+硬约束：只推荐工具返回中 fits_budget=true 或略超预算(over_ratio≤1.3)的候选。"""
+
+LOCAL_PLAN_PROMPT = """你是「旅图」的本地出行攻略编排师——用户是住在「所在城市」的本地人，
+在本市或周边近游玩耍 1-2 天，不是外地游客。
+
+工作方式：严格按"攻略先行 → 多源验证 → 编排填充"的顺序调研，最后必须调用
+submit_result 提交结论。
+
+1) 攻略先行：用户消息若带「攻略深读」字段，那是前置深读子代理提炼的真实
+   本地经验——直接拿它当骨架，被点名的景点/店优先编排；缺该字段或需补
+   特定主题时调 search_xhs_notes 用「X 周末」「X citywalk」「X 本地人 美食」
+   类角度轻量补搜；都没有时看 get_city_intel 的网页攻略摘要。
+2) 骨架验证：get_city_profile 看知识库景点/美食/贴士/消费档；get_city_intel 拿
+   实时天气与近4天逐日预报（行程落在预报窗口内的要在 notes/guide 里写清）、
+   高德POI、去哪儿真实票价（scenic_qunar.ticket 是真实挂牌价）。
+   笔记/摘要里的店名/景点先用 search_pois 核实真实存在再编进方案；
+   需要特定玩法（夜市/老街/公园/博物馆/亲子/露营）时用 search_pois 主动补充。
+3) 本地交通：市内目的地不查大交通；周边目的地也不用调交通工具——接驳
+   信息由系统按出行方式（公共交通/自驾/骑行）自动估算注入。
+   预算自检用 calc_budget：市内目的地 transport_one_way 传 0，
+   周边传估算单程价。
+4) 编排 3-5 套差异化本地攻略（主题如：老城漫步/寻味扫街/山野放空/
+   亲子放电/文艺看展，按目的地特点自由命名）：
+   - 每套 days 数量 = 用户天数；槽位可用 早餐/上午/午餐/下午/下午茶/傍晚/晚餐/晚上/夜宵
+   - 差异化硬约束：各套从「攻略深读」候选池与实时POI里抽**不同子集**——
+     同一景点最多出现在一半方案里；空间走向/主题要错开，
+     不要拿同一条路线换个名字当两套方案
+   - 本地视角：多挖本地人常去的宝藏地、菜市场/老街/社区店，不只堆地标；
+     避雷要实（排队/宰客/踩雷）
+   - 出行风格：特种兵式=早出晚归高密度；休闲随意式=睡到自然醒、午后留白；
+     适中=常规节奏
+   - 景点名可来自知识库 attractions 或工具返回的高德POI名称；美食名同理，
+     优先选评分高的真实POI
+   - 不要排往返交通项（系统自动处理接驳/市内交通）；市内一日游不产生住宿
+   - hotel_factor(0.8~1.5)/food_factor 区分方案档位
+   - 调 calc_budget 自检每套总价是否贴合预算，门票优先用真实票价求和
+
+最后用 submit_result 提交，payload 结构：
+{"plans":[{"name":"≤8字方案名","pace":"节奏","desc":"≤25字定位","hotel_factor":1.0,
+           "food_factor":1.0,"days":[{"day":1,"title":"当日标题","items":[
+           {"slot":"上午","type":"景点","name":"真实名称"}]}],
+           "guide":"本套详细攻略正文(###小节/-列表/**重点**，300-600字)：
+                    本地人怎么玩、什么节奏、吃什么、避雷提醒；
+                    优先复述「攻略深读」里核实过的真实经验，
+                    没有深读摘要时才按通用经验写，不编造店名和数字"}],
+ "notes":["出行提示3-5条"],"dropped":[{"name":"剔除景点名","reason":"理由"}]}
 
 硬约束：真实景点/美食名只能从工具数据或攻略深读摘要中选，不要编造。"""
 
@@ -402,18 +503,23 @@ def _date_ctx(req):
 
 
 def n_agent_rank(s: S):
-    """LLM Agent：自主调工具调研候选，输出排序+点评+首推。"""
+    """LLM Agent：自主调工具调研候选，输出排序+点评+首推。
+    本地游（req.local）时换用本地策划师 agent 与 scan_local 候选池。"""
     req, origin = s["req"], s["origin"]
+    local = bool(req.get("local"))
     meta = tools.date_meta(req.get("date"), req["days"])
     user_msg = json.dumps({
-        "出发地": origin["name"], "预算": req["budget"], "天数": req["days"],
+        "所在城市" if local else "出发地": origin["name"],
+        "预算": req["budget"], "天数": req["days"],
         "出行方式": req.get("transport", "auto"), "偏好": req.get("prefs") or [],
         "出发日期": _date_ctx(req),
-        "圈定省份": req.get("provinces") or "不限（全国可达范围）",
+        "圈定省份": (None if local else req.get("provinces")) or
+                 ("本地游：本城+周边" if local else "不限（全国可达范围）"),
         "当前月份": datetime.now().month,
     }, ensure_ascii=False)
 
-    msgs, err, steps = _run_react(_rec_agent(), user_msg)
+    agent = _rec_local_agent() if local else _rec_agent()
+    msgs, err, steps = _run_react(agent, user_msg)
     out, ext_err = _extract_structured(msgs, schemas.RecOut)
     if err:
         steps.append(_t("brain", "LLM 调研", f"调用失败：{str(err)[:60]}，转规则引擎"))
@@ -426,12 +532,17 @@ def n_agent_rank(s: S):
         return _rule_rank_pipeline(s, steps)
 
     # 合并：模型给排序/分数/点评/首推，代码回填真实距离/费用/交通
-    scanned = {x["city"]: x for x in
-               tools.scan_destinations(None, origin, req["budget"], req["days"],
-                                       req.get("transport", "auto"),
-                                       req.get("prefs") or [],
-                                       provinces=req.get("provinces") or None)
-               if x["feasible"]}
+    if local:
+        scanned_list = tools.scan_local(None, origin, req["budget"],
+                                        req["days"],
+                                        req.get("transport") or "transit",
+                                        req.get("prefs") or [])
+    else:
+        scanned_list = tools.scan_destinations(
+            None, origin, req["budget"], req["days"],
+            req.get("transport", "auto"), req.get("prefs") or [],
+            provinces=req.get("provinces") or None)
+    scanned = {x["city"]: x for x in scanned_list if x["feasible"]}
     cities = {c["name"]: c for c in tools.load_cities()}
     dests = []
     for item in ranking[:6]:
@@ -449,6 +560,7 @@ def n_agent_rank(s: S):
             "city": name, "province": c["province"] or sc.get("province", ""),
             "score": max(0, min(100, int(item.score))),
             "km": sc["km"], "lat": c["lat"], "lng": c["lng"],
+            "kind": sc.get("kind"),
             "tags": c["tags"], "in_kb": in_kb,
             "transport_est": sc["transport_est"],
             "rough_total": sc["rough_total"], "hotelPerNight": c["hotelPerNight"],
@@ -474,7 +586,8 @@ def n_agent_rank(s: S):
                 f"{tag}短途圈·票源相对稳" if h <= 4
                 else f"{tag}长线·车票紧俏需早订" if h >= 7
                 else f"{tag}出行档")
-    extra = [r for r in tools.rank_destinations(
+    rank_fn = tools.rank_local if local else tools.rank_destinations
+    extra = [r for r in rank_fn(
                  None, list(scanned.values()), req["budget"], req["days"],
                  req.get("prefs") or [], meta=meta)
              if r["city"] not in picked]
@@ -499,24 +612,32 @@ def _rule_reasons(sc, c, req):
 
 
 def _rule_rank_pipeline(s: S, prior_steps):
-    """规则兜底：scan+rank 内联执行。"""
+    """规则兜底：scan+rank 内联执行。本地游走 scan_local 候选池。"""
     req = s["req"]
-    scanned = tools.scan_destinations(None, s["origin"], req["budget"], req["days"],
-                                      req.get("transport", "auto"),
-                                      req.get("prefs") or [],
-                                      provinces=req.get("provinces") or None)
+    local = bool(req.get("local"))
+    if local:
+        scanned = tools.scan_local(None, s["origin"], req["budget"], req["days"],
+                                   req.get("transport") or "transit",
+                                   req.get("prefs") or [])
+    else:
+        scanned = tools.scan_destinations(None, s["origin"], req["budget"],
+                                          req["days"],
+                                          req.get("transport", "auto"),
+                                          req.get("prefs") or [],
+                                          provinces=req.get("provinces") or None)
     feas = [x for x in scanned if x["feasible"]]
     steps = prior_steps + [
-        _t("scan", "扫描候选目的地",
-           f"共评估 {len(scanned)} 个目的地，{len(feas)} 个满足硬约束")]
+        _t("scan", "扫描本地候选" if local else "扫描候选目的地",
+           f"共评估 {len(scanned)} 个{'本地去处' if local else '目的地'}，"
+           f"{len(feas)} 个满足硬约束")]
     out = {"scanned": scanned, "trace": steps}
     if not feas:
         out["message"] = "当前条件下没有可行的目的地，建议提高预算或放宽出行方式"
         return out
-    ranked = tools.rank_destinations(None, scanned, req["budget"], req["days"],
-                                     req.get("prefs") or [],
-                                     meta=tools.date_meta(req.get("date"),
-                                                          req["days"]))
+    rank_fn = tools.rank_local if local else tools.rank_destinations
+    ranked = rank_fn(None, scanned, req["budget"], req["days"],
+                     req.get("prefs") or [],
+                     meta=tools.date_meta(req.get("date"), req["days"]))
     out["ranked"], out["more"] = ranked[:6], ranked[6:30]
     out["total_feasible"] = len(feas)
     out["trace"] = steps + [_t("rank", "多因子打分排序",
@@ -528,14 +649,22 @@ def _rule_rank_pipeline(s: S, prior_steps):
 
 def n_scan(s: S):
     req = s["req"]
-    scanned = tools.scan_destinations(None, s["origin"], req["budget"], req["days"],
-                                      req.get("transport", "auto"),
-                                      req.get("prefs") or [],
-                                      provinces=req.get("provinces") or None)
+    local = bool(req.get("local"))
+    if local:
+        scanned = tools.scan_local(None, s["origin"], req["budget"], req["days"],
+                                   req.get("transport") or "transit",
+                                   req.get("prefs") or [])
+    else:
+        scanned = tools.scan_destinations(None, s["origin"], req["budget"],
+                                          req["days"],
+                                          req.get("transport", "auto"),
+                                          req.get("prefs") or [],
+                                          provinces=req.get("provinces") or None)
     feas = [x for x in scanned if x["feasible"]]
     out = {"scanned": scanned,
-           "trace": [_t("scan", "扫描候选目的地",
-                        f"共评估 {len(scanned)} 个目的地，{len(feas)} 个满足"
+           "trace": [_t("scan", "扫描本地候选" if local else "扫描候选目的地",
+                        f"共评估 {len(scanned)} 个"
+                        f"{'本地去处' if local else '目的地'}，{len(feas)} 个满足"
                         f"「{_mode_label(req.get('transport','auto'))} + ¥{req['budget']}"
                         f" + {req['days']}天」硬约束")]}
     if not feas:
@@ -545,10 +674,10 @@ def n_scan(s: S):
 
 def n_rank(s: S):
     req = s["req"]
-    ranked = tools.rank_destinations(None, s["scanned"], req["budget"], req["days"],
-                                     req.get("prefs") or [],
-                                     meta=tools.date_meta(req.get("date"),
-                                                          req["days"]))
+    rank_fn = tools.rank_local if req.get("local") else tools.rank_destinations
+    ranked = rank_fn(None, s["scanned"], req["budget"], req["days"],
+                     req.get("prefs") or [],
+                     meta=tools.date_meta(req.get("date"), req["days"]))
     return {"ranked": ranked[:6], "more": ranked[6:30],
             "total_feasible": sum(1 for x in s["scanned"] if x["feasible"]),
             "trace": [_t("rank", "多因子打分排序",
@@ -597,6 +726,8 @@ def n_guide_dive(s: S):
         "目的地": req["dest"].rstrip("市"), "天数": req["days"],
         "出行风格": req.get("style") or "适中",
         "偏好": req.get("prefs") or [], "出发日期": _date_ctx(req),
+        "场景": "本地游（本市+近郊，本地人周末玩法）" if req.get("local")
+              else "跨城旅行",
     }, ensure_ascii=False)
     msgs, err, steps = _run_react(_dive_agent(), user_msg)
     out, ext_err = _extract_structured(msgs, schemas.GuideDigest)
@@ -615,17 +746,24 @@ def n_guide_dive(s: S):
 
 
 def n_agent_plan(s: S):
-    """LLM Agent：自主调研目的地（画像/情报/车次/预算），输出 3-5 套行程。"""
+    """LLM Agent：自主调研目的地（画像/情报/车次/预算），输出 3-5 套行程。
+    本地游（req.local）时换用本地编排师 agent，不做大交通调研。"""
     req, origin = s["req"], s["origin"]
-    msg = {"出发地": origin["name"], "目的地": req["dest"], "预算": req["budget"],
+    local = bool(req.get("local"))
+    msg = {"所在城市" if local else "出发地": origin["name"],
+           "去处" if local else "目的地": req["dest"],
+           "预算": req["budget"],
            "天数": req["days"], "出行方式": req.get("transport", "auto"),
            "出发日期": _date_ctx(req), "出行风格": req.get("style") or "适中",
            "偏好": req.get("prefs") or [], "当前月份": datetime.now().month}
+    if local:
+        msg["场景"] = "本地游：本市内/周边 1-2 天近游，非外地游客"
     if s.get("guide_intel"):                     # 嵌套深读摘要 → 攻略骨架
         msg["攻略深读"] = s["guide_intel"]
     user_msg = json.dumps(msg, ensure_ascii=False)
 
-    msgs, err, steps = _run_react(_plan_agent(), user_msg)
+    agent = _plan_local_agent() if local else _plan_agent()
+    msgs, err, steps = _run_react(agent, user_msg)
     tool_data = _collect_tool_data(msgs)
     out, ext_err = _extract_structured(msgs, schemas.PlansOut)
     if err or not out or not getattr(out, "plans", None):
@@ -644,19 +782,21 @@ def n_agent_plan(s: S):
                     "judge_engine": "rule-fallback", "tool_data": tool_data,
                     "trace": steps}
         intel = tools.fetch_intel(None, req["dest"], date=req.get("date"),
-                                  days=req["days"], prefs=req.get("prefs"))
+                                  days=req["days"], prefs=req.get("prefs"),
+                                  local=local)
         judged = tools.judge_intel(None, intel, req["days"],
                                    req.get("prefs") or [], date=req.get("date"))
         result = tools.compose_plans(None, origin, req["dest"], req["budget"],
                                      req["days"], req.get("transport", "auto"),
                                      req.get("prefs") or [], judged,
                                      date=req.get("date"),
-                                     style=req.get("style"))
+                                     style=req.get("style"), local=local)
         return {"intel": intel, "judged": judged, "result": result,
                 "guide": tools.build_guide(c, intel, judged,
                                            tool_data=tool_data,
                                            transport=result.get("transport"),
-                                           digest=s.get("guide_intel")),
+                                           digest=s.get("guide_intel"),
+                                           local=local),
                 "judge_engine": "rule-fallback", "tool_data": tool_data,
                 "trace": steps + _compose_trace(result, req)}
 
@@ -671,22 +811,27 @@ def n_assemble(s: S):
         return {}
     req, origin = s["req"], s["origin"]
     tool_data = s.get("tool_data") or {}
+    local = bool(req.get("local"))
     dest_name = req["dest"].rstrip("市")
     c = tools.get_city(dest_name) or _pseudo_city(dest_name)   # 知识库→池→地理编码→中性档
 
-    transport, km, mode = _resolve_transport(origin, c, req, tool_data)
+    if local:
+        transport, km, mode = _resolve_local_transport(origin, c, req, tool_data)
+    else:
+        transport, km, mode = _resolve_transport(origin, c, req, tool_data)
+    is_home = local and transport.get("mode") == "local"   # 本城：无接驳交通项
     att_map = {a["n"]: a for a in c["attractions"]}
     food_map = {f["n"]: f for f in c["foods"]}
     poi_map = _poi_map(tool_data)                   # 高德实时POI也可作行程项
     food_pool = (list(food_map.values())
                  + list(_poi_food_map(tool_data).values()))  # 美食备选池
 
-    plans = []
+    plans, plan_sets, swaps = [], [], 0
     for i, p in enumerate(out.plans):
         days_out, used_tickets = [], 0.0
         for d in p.days[:req["days"]]:
             items = []
-            if d.day == 1:
+            if d.day == 1 and not is_home:
                 items.append({"slot": "上午", "type": "交通",
                               "name": f"{origin['name']} → {c['name']}",
                               "note": transport["outbound"],
@@ -699,23 +844,71 @@ def n_assemble(s: S):
                     items.append(mapped)
                     if mapped.get("_ticket"):
                         used_tickets += mapped.pop("_ticket")
-            if d.day == req["days"]:
-                items.append({"slot": "下午", "type": "交通",
+            if d.day == req["days"] and not is_home:
+                items.append({"slot": "傍晚" if local else "下午",
+                              "type": "交通",
                               "name": f"{c['name']} → {origin['name']} 返程",
                               "note": transport["back"],
                               "cost": transport["cost"],
                               "hours": transport.get("hours")})
             title = (d.title or "").strip() or tools._day_title(
                 d.day, req["days"], [a for a in c["attractions"]
-                                     if any(i["name"] == a["n"] for i in items)])
+                                     if any(i["name"] == a["n"] for i in items)],
+                local=local)
             days_out.append({"day": d.day, "title": title[:14], "items": items})
         if not days_out:
             continue
+        ref = set().union(*plan_sets) if plan_sets else set()
+        # 单方案内去重：同名景点/美食/休闲只留第一次出现，
+        # 重复项从候选池换入未用过的；换无可换就删（哪怕饭店也不能重复）
+        seen_in_plan = set()
+        for d in days_out:
+            kept = []
+            for it in d["items"]:
+                tp, nm = it.get("type"), (it.get("name") or "")
+                if tp in ("景点", "美食", "休闲") and nm and not it.get("_float"):
+                    if tools._name_dup(nm, seen_in_plan):
+                        rep = _replace_dup(it, att_map, poi_map,
+                                           food_pool, seen_in_plan | ref)
+                        if rep is not None:
+                            rep["slot"], rep["type"] = it["slot"], tp
+                            if tp == "景点":
+                                used_tickets += ((rep.get("cost") or 0)
+                                                 - (it.get("cost") or 0))
+                            kept.append(rep)
+                            seen_in_plan.add(tools._norm_spot(rep["name"]))
+                        else:
+                            it["_dropped_dup"] = True
+                        continue
+                    seen_in_plan.add(tools._norm_spot(nm))
+                kept.append(it)
+            d["items"] = kept
+        # 方案去重兜底：与已成型方案景点集合重合 ≥70%（比如深读 top1 骨架被
+        # 复制进每套方案）→ 从验证过的候选池随机换入还没用过的景点
+        cur = _plan_spot_names(days_out)
+        dup = cur & ref
+        if ref and cur and len(dup) / len(cur) >= 0.7:
+            pool = _unused_candidates(att_map, poi_map, ref | cur)
+            random.shuffle(pool)
+            for d in days_out:
+                for idx, it in enumerate(d["items"]):
+                    if (it.get("type") == "景点"
+                            and tools._norm_spot(it.get("name") or "") in dup
+                            and pool):
+                        rep = pool.pop()
+                        rep["slot"], rep["type"] = it["slot"], "景点"
+                        used_tickets += ((rep.get("cost") or 0)
+                                         - (it.get("cost") or 0))
+                        d["items"][idx] = rep
+                        swaps += 1
+            cur = _plan_spot_names(days_out)
+        plan_sets.append(cur)
         tools.assign_times(days_out, req.get("style") or "适中", c)
         b = geo.trip_budget(c, req["days"], transport["cost"],
                             hotel_factor=getattr(p, "hotel_factor", 1.0) or 1.0,
                             food_factor=getattr(p, "food_factor", 1.0) or 1.0,
-                            attraction_ticket_sum=used_tickets)
+                            attraction_ticket_sum=used_tickets,
+                            nights=0 if is_home else None)
         over = b["total"] > req["budget"]
         plans.append({
             "id": f"agent{i}", "name": p.name[:12], "desc": (p.desc or "")[:30],
@@ -727,19 +920,21 @@ def n_assemble(s: S):
 
     if len(plans) < 3:                           # 方案不足 → 规则兜底（非知识库城市也可）
         intel = tools.fetch_intel(None, req["dest"], date=req.get("date"),
-                                  days=req["days"], prefs=req.get("prefs"))
+                                  days=req["days"], prefs=req.get("prefs"),
+                                  local=local)
         judged = tools.judge_intel(None, intel, req["days"],
                                    req.get("prefs") or [], date=req.get("date"))
         result = tools.compose_plans(None, origin, req["dest"], req["budget"],
                                      req["days"], req.get("transport", "auto"),
                                      req.get("prefs") or [], judged,
                                      date=req.get("date"),
-                                     style=req.get("style"))
+                                     style=req.get("style"), local=local)
         return {"intel": intel, "judged": judged, "result": result,
                 "guide": tools.build_guide(c, intel, judged,
                                            tool_data=tool_data,
                                            transport=result.get("transport"),
-                                           digest=s.get("guide_intel")),
+                                           digest=s.get("guide_intel"),
+                                           local=local),
                 "judge_engine": "rule-fallback",
                 "trace": [_t("judge", "方案校验", "LLM 方案不足3套，转规则编排")
                           ] + _compose_trace(result, req)}
@@ -776,15 +971,67 @@ def n_assemble(s: S):
                 pl, dict(judged,
                          qunar_scenic=intel.get("scenic_qunar") or []))
     guide = tools.build_guide(c, intel, judged, tool_data=tool_data,
-                              transport=transport, digest=digest or None)
+                              transport=transport, digest=digest or None,
+                              local=local)
+    trace_out = [_t("judge", "LLM 编排完成",
+                    f"{len(plans)} 套方案通过校验，剔除 {len(dropped)} 项")]
+    if swaps:
+        trace_out.append(_t("judge", "方案去重",
+                            f"方案间景点重合过高，已随机换入 {swaps} 个未用候选"))
+    trace_out.append(_transport_step(req, transport))
     return {"intel": intel, "judged": judged, "result": result,
-            "guide": guide, "judge_engine": "llm-agent",
-            "trace": [_t("judge", "LLM 编排完成",
-                         f"{len(plans)} 套方案通过校验，"
-                         f"剔除 {len(dropped)} 项")
-                      ] + [_t("rail", "查询去程/回程交通",
-                              f"去程 {transport['outbound']}｜回程 {transport['back']}"
-                              f"（{'12306实时' if transport['src']=='12306' else '估算'}）")]}
+            "guide": guide, "judge_engine": "llm-agent", "trace": trace_out}
+
+
+def _plan_spot_names(days_out):
+    """一套方案里排掉的 景点/美食/休闲 名归一化集合（判重用，不含交通项）。"""
+    return {tools._norm_spot(it["name"]) for d in days_out
+            for it in d.get("items") or []
+            if it.get("type") in ("景点", "美食", "休闲") and it.get("name")}
+
+
+def _unused_candidates(att_map, poi_map, used_names):
+    """候选池里所有方案都还没用过的景点素材，供去重换入。
+    topK 候选（知识库景点 + 高德/去哪儿 POI）→ 随机抽取。"""
+    pool = []
+    for a in att_map.values():
+        if tools._norm_spot(a["n"]) not in used_names:
+            pool.append({"name": a["n"], "note": a["desc"], "cost": a["ticket"],
+                         "hours": a["hours"]})
+    for p in poi_map.values():
+        nm = (p.get("name") or "")[:16]
+        if (nm and tools._norm_spot(nm) not in used_names
+                and all(x["name"] != nm for x in pool)):
+            pool.append({"name": nm,
+                         "note": f"{p.get('_src') or '高德POI'} · "
+                                 f"评分{p.get('rating') or '—'}",
+                         "cost": _poi_cost(p, 45), "hours": 3,
+                         "loc": tools._parse_loc(p.get("location"))})
+    return pool
+
+
+def _replace_dup(it, att_map, poi_map, food_pool, used):
+    """为单方案内重复出现的行程项找未用过的同类型替换（饭店重复也算重复）；
+    找不到返回 None 由调用方丢弃。"""
+    if it.get("type") == "景点":
+        pool = _unused_candidates(att_map, poi_map, used)
+        if pool:
+            return random.choice(pool)
+        return None
+    for f in food_pool or []:
+        nm = (f.get("n") or f.get("name") or "")[:16]
+        if not nm or tools._norm_spot(nm) in used:
+            continue
+        try:
+            cost = round(float(f.get("p") if f.get("p") is not None
+                               else f.get("cost") or 60)) or 60
+        except (TypeError, ValueError):
+            cost = 60
+        return {"name": nm, "cost": cost,
+                "note": (f.get("d")
+                         or f"高德POI · 评分{f.get('rating') or '—'}")[:40],
+                "loc": f.get("loc") or tools._parse_loc(f.get("location"))}
+    return None
 
 
 def _resolve_transport(origin, c, req, tool_data):
@@ -843,6 +1090,35 @@ def _resolve_transport(origin, c, req, tool_data):
              "trains": fo["trains"][:6], "query_date": fo.get("date", ""),
              "ret_date": (ro or {}).get("date")},
             km, mode)
+
+
+def _resolve_local_transport(origin, c, req, tool_data):
+    """本地游交通：本城（dest=所在城市）无大交通，仅市内接驳；
+    周边区县/邻城按出行方式估一段短途接驳（公共交通/自驾/骑行）。"""
+    km = geo.haversine_km(origin["lat"], origin["lng"], c["lat"], c["lng"])
+    if km <= 3 or origin["name"] == c["name"]:
+        return ({"mode": "local", "src": "local", "hours": 0, "cost": 0,
+                 "outbound": "本城出行 · 市内交通接驳", "back": "",
+                 "trains": []}, 0.0, "local")
+    est = geo.estimate_local(km, req.get("transport") or "transit")
+    return ({"mode": est["mode"], "src": "model", "hours": est.get("hours"),
+             "cost": est.get("cost") or 0,
+             "outbound": f"{est['desc']} 约{est.get('hours')}h",
+             "back": f"{est['desc']} 约{est.get('hours')}h · 傍晚返程",
+             "trains": []}, km, est["mode"])
+
+
+def _transport_step(req, ti):
+    """交通 trace 步：本地游换市内/接驳口径。"""
+    if req.get("local") and ti.get("mode") == "local":
+        return _t("pin", "市内出行",
+                  ti.get("outbound") or "本城范围 · 地铁/公交/骑行接驳")
+    if req.get("local"):
+        return _t("rail", "周边短途接驳",
+                  f"去程 {ti['outbound']}｜回程 {ti['back']}（估算）")
+    return _t("rail", "查询去程/回程交通",
+              f"去程 {ti['outbound']}｜回程 {ti['back']}"
+              f"（{'12306实时' if ti.get('src') == '12306' else '估算'}）")
 
 
 def _pseudo_city(name):
@@ -1003,10 +1279,9 @@ def _intel_from_tools(c, tool_data, digest=None):
 
 def _compose_trace(result, req):
     ti = result["transport"]
-    return [_t("rail", "查询去程/回程交通",
-               f"去程 {ti['outbound']}｜回程 {ti['back']}"
-               f"（{'12306实时' if ti['src']=='12306' else '估算'}）"),
-            _t("plan", f"生成 {len(result['plans'])} 套出游方案",
+    return [_transport_step(req, ti),
+            _t("plan", f"生成 {len(result['plans'])} 套"
+               + ("本地攻略" if req.get("local") else "出游方案"),
                "、".join(p["name"] for p in result["plans"]))]
 
 
@@ -1015,7 +1290,8 @@ def _compose_trace(result, req):
 def n_fetch_intel(s: S):
     req = s["req"]
     intel = tools.fetch_intel(None, req["dest"], date=req.get("date"),
-                              days=req["days"], prefs=req.get("prefs"))
+                              days=req["days"], prefs=req.get("prefs"),
+                              local=bool(req.get("local")))
     return {"intel": intel,
             "trace": [_t("search", f"搜索「{req['dest']}」当地特色与攻略",
                          "数据来源：" + " + ".join(intel["sources"]))]}
@@ -1034,16 +1310,17 @@ def n_judge_rule(s: S):
 
 def n_compose(s: S):
     req = s["req"]
+    local = bool(req.get("local"))
     result = tools.compose_plans(None, s["origin"], req["dest"], req["budget"],
                                  req["days"], req.get("transport", "auto"),
                                  req.get("prefs") or [], s["judged"],
                                  date=req.get("date"),
-                                 style=req.get("style"))
+                                 style=req.get("style"), local=local)
     c = next((x for x in tools.load_cities()
               if x["name"] == req["dest"].rstrip("市")), None) \
         or _pseudo_city(req["dest"])
     guide = tools.build_guide(c, s["intel"], s["judged"],
-                              transport=result.get("transport"))
+                              transport=result.get("transport"), local=local)
     return {"result": result, "guide": guide,
             "trace": _compose_trace(result, req)}
 

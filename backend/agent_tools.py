@@ -56,6 +56,39 @@ def scan_destinations(origin_city: str, budget: int, days: int,
 
 
 @tool
+def scan_local(origin_city: str, budget: int, days: int,
+               transport: str = "transit", prefs: list = None):
+    """本地游候选扫描：本城本身（市内玩法）+ 本城下辖区县 +
+    周边 ≤160km 的城镇。返回每处：kind(市内|周边)/距离km/单程耗时h/
+    单程费用cost/预估总花费rough_total/fits_budget/in_kb/tags。
+    本地游面向本地人 1-2 天近游：市内候选无大交通与住宿，周边为短途往返。
+    transport: transit 公共交通 | drive 自驾打车 | bike 骑行步行。"""
+    origin = _city(origin_city)
+    if not origin:                                  # 非知识库城市 → 高德地理编码兜底
+        g = apis.geocode(origin_city)
+        if g and g.get("lat"):
+            origin = {"name": origin_city.rstrip("市"), "province": g.get("city") or "",
+                      "lat": g["lat"], "lng": g["lng"]}
+        else:
+            return _j({"error": f"所在城市「{origin_city}」无法定位"})
+    out = T.scan_local(None, origin, budget, days,
+                       transport or "transit", prefs or [])
+    cities = {c["name"]: c for c in T.load_cities()}
+    feas = [s for s in out if s.get("feasible")]
+    feas.sort(key=lambda s: (not s["fits_budget"], s["km"]))
+    rows = [{"city": s["city"], "kind": s.get("kind"), "km": round(s["km"]),
+             "mode": s["transport_est"]["mode"],
+             "hours": s["transport_est"].get("hours"),
+             "cost": s["transport_est"]["cost"],
+             "rough_total": s["rough_total"], "fits_budget": s["fits_budget"],
+             "in_kb": s["in_kb"],
+             "tags": (cities.get(s["city"]) or {}).get("tags") or []}
+            for s in feas[:40]]
+    return _j({"total_feasible": len(feas), "returned": len(rows),
+               "candidates": rows})
+
+
+@tool
 def get_city_profile(city: str):
     """查看某城市画像：标签、佳季、酒店/餐饮消费档、全部景点(名称/简介/
     建议时长h/门票/推荐度0-5)、特色美食、实用贴士。"""
@@ -261,6 +294,8 @@ def submit_result(payload: dict):
 
 REC_TOOLS = [scan_destinations, get_city_profile, get_city_intel,
              travel_trends, submit_result]
+LOCAL_REC_TOOLS = [scan_local, get_city_profile, get_city_intel,
+                   search_pois, travel_trends, submit_result]
 PLAN_TOOLS = [get_city_profile, get_city_intel, search_pois, search_xhs_notes,
               travel_trends, query_trains, estimate_transport, calc_budget,
               submit_result]

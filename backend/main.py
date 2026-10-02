@@ -187,6 +187,7 @@ class RecommendReq(BaseModel):
     style: str = "适中"               # 游玩风格：特种兵|适中|休闲随意
     prefs: list[str] = []
     provinces: list[str] = []          # 用户圈定的出行范围（省份名），空=全部可达
+    local: bool = False                # 本地游：本城+周边≤160km，1-2天近游
 
 
 class PlanReq(RecommendReq):
@@ -205,6 +206,7 @@ def status():
                 "relay_online": xhs_relay.online()},
         "cities": len(tools.load_cities()),
         "modes": list(__import__("geo").TRANSPORT_MODES.items()),
+        "local_modes": list(__import__("geo").LOCAL_MODES.items()),
     }
 
 

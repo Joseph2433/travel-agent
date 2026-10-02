@@ -42,7 +42,15 @@
     <section class="panel form-panel" id="formPanel">
       <div class="frow">
         <div class="fgroup grow">
-          <label>出发位置</label>
+          <div class="chips chips-mode" id="chipsMode">
+            <button class="chip on" data-v="local">🏙 本地游 · 城市周边</button>
+            <button class="chip" data-v="trip">🧭 出远门 · 跨城旅行</button>
+          </div>
+        </div>
+      </div>
+      <div class="frow">
+        <div class="fgroup grow">
+          <label id="lblOrigin">所在城市</label>
           <div class="loc-line">
             <button class="btn ghost" id="btnGeo" type="button">
               <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="8"/></svg>
@@ -76,11 +84,16 @@
         </div>
         <div class="fgroup grow">
           <label>出行方式</label>
-          <div class="chips" id="chipsTransport">
+          <div class="chips" id="chipsTransport" style="display:none">
             <button class="chip on" data-v="auto">不限 · 智能推荐</button>
             <button class="chip" data-v="train">高铁/火车</button>
             <button class="chip" data-v="flight">飞机</button>
             <button class="chip" data-v="drive">自驾</button>
+          </div>
+          <div class="chips" id="chipsTransportLocal">
+            <button class="chip on" data-v="transit">公共交通</button>
+            <button class="chip" data-v="drive">自驾/打车</button>
+            <button class="chip" data-v="bike">骑行/步行</button>
           </div>
         </div>
         <div class="fgroup">
@@ -110,14 +123,18 @@
             <button class="chip" data-v="文艺">文艺街区</button>
             <button class="chip" data-v="亲子">亲子</button>
             <button class="chip" data-v="摄影">摄影</button>
+            <button class="chip local-only" data-v="城市漫步">城市漫步</button>
+            <button class="chip local-only" data-v="遛娃">遛娃</button>
+            <button class="chip local-only" data-v="看展">看展逛馆</button>
+            <button class="chip local-only" data-v="露营">露营野餐</button>
           </div>
         </div>
         <div class="fgroup">
-          <label>指定目的地 <small>（可选，留空则 AI 推荐）</small></label>
-          <input type="text" id="inpDest" placeholder="如：大理 / 景德镇…"
+          <label id="lblDest">指定去处 <small>（可选，留空则 AI 推荐）</small></label>
+          <input type="text" id="inpDest" placeholder="如：西湖 / 乌镇 / 夜市…"
                  style="width:170px">
         </div>
-        <button class="btn primary" id="btnGo">开始规划
+        <button class="btn primary" id="btnGo">找本地玩法
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
         </button>
       </div>

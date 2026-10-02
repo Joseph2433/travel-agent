@@ -97,6 +97,13 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 .chip.scope{padding:5px 12px;font-size:12px}
 .chip.scope i{font-style:normal;font-size:11px;opacity:.55;margin-left:2px}
 .chip.scope.on i{opacity:.8}
+/* 模式开关：本地游/出远门 */
+.chips-mode{gap:0;border:1.5px solid var(--line);border-radius:999px;
+  padding:3px;display:inline-flex;background:#fff}
+.chips-mode .chip{border-color:transparent;font-weight:500}
+.chips-mode .chip.on{background:var(--ink)}
+.chip.local-only{display:none}      /* 本地专属偏好，applyMode 控制显隐 */
+.tag.kind{background:rgba(15,163,168,.16);color:#0b7c80;font-weight:600}
 
 /* buttons */
 .btn{display:inline-flex;align-items:center;gap:7px;padding:10px 22px;

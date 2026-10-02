@@ -103,6 +103,7 @@ const MON_KIND = {recommend: "目的地推荐", plan: "出游方案", scope: "�
 
 function monParams(r){
   const parts = [];
+  if (r.local) parts.push("本地游");
   if (r.origin || r.city) parts.push("出发=" + (r.origin || r.city));
   if (r.dest) parts.push("目的地=" + r.dest);
   if (r.budget) parts.push("¥" + r.budget);
@@ -218,6 +219,49 @@ const state = { origin: null, dests: [], plans: [], intel: null, map: null,
                 provinces: [], view: "home", planIdx: null, guide: null,
                 lastPlanResp: null };
 
+/* ── 模式：本地游(本城+周边≤160km) / 出远门(跨城) ──
+   localStorage 记忆 + ?mode=local|trip 直达分享 */
+let MODE = (() => {
+  const q = new URLSearchParams(location.search).get("mode");
+  if (q === "local" || q === "trip") localStorage.setItem("ta_mode", q);
+  return localStorage.getItem("ta_mode") || "local";
+})();
+
+const GO_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+const goBtnHtml = () => (MODE === "local" ? "找本地玩法 " : "开始规划 ") + GO_SVG;
+
+function applyMode(){
+  const local = MODE === "local";
+  $$("#chipsMode .chip").forEach(x =>
+    x.classList.toggle("on", (x.dataset.v === "local") === local));
+  $("#lblOrigin").childNodes[0].textContent = local ? "所在城市" : "出发位置";
+  $("#chipsTransport").style.display = local ? "none" : "";
+  $("#chipsTransportLocal").style.display = local ? "" : "none";
+  $$("#chipsPrefs .local-only").forEach(x =>
+    x.style.display = local ? "inline-block" : "none");
+  const b = $("#budget");
+  b.min = local ? 30 : 500; b.max = local ? 2000 : 20000;
+  b.step = local ? 10 : 100;
+  b.value = local ? 300 : 3000;                     // 切模式重置为该档默认预算
+  b.dispatchEvent(new Event("input"));
+  state.setDays && state.setDays(local ? 1 : 3);
+  $("#lblDest").innerHTML = (local ? "指定去处" : "指定目的地") +
+    ' <small>（可选，留空则 AI 推荐）</small>';
+  $("#inpDest").placeholder = local ? "如：西湖 / 乌镇 / 夜市…"
+                                  : "如：大理 / 景德镇…";
+  $("#btnGo").innerHTML = goBtnHtml();
+  $(".hero-eyebrow").textContent = local
+    ? "LOCAL LIFE · WEEKEND PLANNER" : "AGENT-POWERED TRAVEL PLANNER";
+  $(".hero-title").innerHTML = local
+    ? "这个周末<br><em>在本地玩点新的</em>"
+    : "下一个目的地<br><em>交给旅图去想</em>";
+  $(".hero-sub").textContent = local
+    ? "所在城市 · 预算 · 天数 · 出行方式 —— Agent 挖出本城与周边的宝藏玩法攻略"
+    : "定位 · 预算 · 天数 · 出行方式 —— Agent 搜索、判断、编排，给你 3-5 套完整出游方案";
+  if (local) $("#scopeRow").style.display = "none";
+  else queueScope();
+}
+
 /* ── 页面视图路由：home(表单) / trace(思考) / dest(推荐) / plans(方案) / plan(详情)
    整页切换 + hash 支持浏览器前进后退 ── */
 const VIEW_EL = { home: ".hero", trace: "#stageTrace", dest: "#stageDest",
@@ -259,6 +303,7 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g,
 /* ── 初始化 ── */
 async function init(){
   bindForm();
+  applyMode();
   bindAuth();
   showView("home", false);
   if (location.hash) history.replaceState(null, "", location.pathname);
@@ -302,6 +347,7 @@ function queueScope(){
   _scopeTimer = setTimeout(loadScope, 350);
 }
 async function loadScope(){
+  if (MODE === "local"){ $("#scopeRow").style.display = "none"; return; }
   const opt = $("#selCity").selectedOptions[0];
   if (!opt || !opt.value) return;
   const body = collectParams();
@@ -368,21 +414,32 @@ function bindForm(){
 
   let days = 3;
   const dv = $("#daysVal");
+  state.setDays = v => { days = Math.max(1, v); dv.textContent = days; };
+  const dayCap = () => (MODE === "local" ? 3 : 10);
   $("#dayMinus").onclick = () => { days = Math.max(1, days - 1); dv.textContent = days; queueScope(); };
-  $("#dayPlus").onclick  = () => { days = Math.min(10, days + 1); dv.textContent = days; queueScope(); };
+  $("#dayPlus").onclick  = () => { days = Math.min(dayCap(), days + 1); dv.textContent = days; queueScope(); };
   state.getDays = () => days;
+
+  /* 模式切换：本地游 ↔ 出远门 */
+  $("#chipsMode").addEventListener("click", e => {
+    const c = e.target.closest(".chip");
+    if (!c || c.classList.contains("on")) return;
+    MODE = c.dataset.v; localStorage.setItem("ta_mode", MODE);
+    applyMode();
+  });
 
   /* 出发日期：可选；min=今天；选中即提示星期/周末/假期/预售期 */
   const inp = $("#inpDate"), t0 = new Date();
   inp.min = `${t0.getFullYear()}-${String(t0.getMonth() + 1).padStart(2, "0")}-${String(t0.getDate()).padStart(2, "0")}`;
   inp.addEventListener("change", () => { dateHint(); queueScope(); });
 
-  $("#chipsTransport").addEventListener("click", e => {
-    const c = e.target.closest(".chip"); if (!c) return;
-    $("#chipsTransport").querySelectorAll(".chip").forEach(x => x.classList.remove("on"));
-    c.classList.add("on");
-    queueScope();
-  });
+  for (const sel of ["#chipsTransport", "#chipsTransportLocal"])
+    $(sel).addEventListener("click", e => {
+      const c = e.target.closest(".chip"); if (!c) return;
+      $(sel).querySelectorAll(".chip").forEach(x => x.classList.remove("on"));
+      c.classList.add("on");
+      queueScope();
+    });
   $("#chipsStyle").addEventListener("click", e => {
     const c = e.target.closest(".chip"); if (!c) return;
     $("#chipsStyle").querySelectorAll(".chip").forEach(x => x.classList.remove("on"));
@@ -430,6 +487,7 @@ function dateHint(){
 
 function collectParams(){
   const opt = $("#selCity").selectedOptions[0];
+  const tSel = MODE === "local" ? "#chipsTransportLocal" : "#chipsTransport";
   return {
     city: opt ? opt.value : null,
     lat: opt && opt.dataset.lat ? +opt.dataset.lat : null,
@@ -437,10 +495,11 @@ function collectParams(){
     budget: +$("#budget").value,
     days: state.getDays(),
     date: $("#inpDate").value || null,
-    transport: $("#chipsTransport .chip.on").dataset.v,
+    transport: $(`${tSel} .chip.on`).dataset.v,
     style: $("#chipsStyle .chip.on").dataset.v,
     prefs: $$("#chipsPrefs .chip.on").map(c => c.dataset.v),
     provinces: state.provinces,
+    local: MODE === "local",
   };
 }
 
@@ -489,18 +548,18 @@ async function streamPost(url, body, onStep){
   return final;
 }
 
-/* ── 阶段一：目的地推荐 ── */
+/* ── 阶段一：目的地/本地玩法推荐 ── */
 async function runRecommend(){
   const btn = $("#btnGo"); btn.disabled = true; btn.textContent = "规划中…";
   const params = collectParams();
   const direct = ($("#inpDest").value || "").trim();
-  if (direct){                       // 指定目的地 → 跳过推荐，直接出方案
+  if (direct){                       // 指定去处 → 跳过推荐，直接出方案
     btn.disabled = false;
-    btn.innerHTML = '开始规划 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+    btn.innerHTML = goBtnHtml();
     runPlans(direct.replace(/市$/, ""));
     return;
   }
-  beginTrace("Agent → 目的地推荐");
+  beginTrace(MODE === "local" ? "Agent → 本地游玩法扫描" : "Agent → 目的地推荐");
   try{
     const r = await streamPost("/api/agent/destinations/stream", params, addTraceStep);
     endTrace();
@@ -513,38 +572,45 @@ async function runRecommend(){
     toast("服务异常：" + e.message);
   }finally{
     btn.disabled = false;
-    btn.innerHTML = '开始规划 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+    btn.innerHTML = goBtnHtml();
   }
 }
 
 const MEDALS = ["NO.1","NO.2","NO.3","NO.4","NO.5","NO.6"];
 
 function renderDestinations(r){
+  const local = !!r.local;
   const sec = $("#stageDest"), grid = $("#destGrid");
-  $("#destMeta").textContent =
-    `从 ${r.origin.name} 出发 · 精选 ${state.dests.length} 个`
+  $("#destMeta").textContent = (local
+      ? `在 ${r.origin.name} 及周边 · 精选 ${state.dests.length} 个去处`
+      : `从 ${r.origin.name} 出发 · 精选 ${state.dests.length} 个`)
     + (r.date ? ` · ${r.date.slice(5).replace("-", "/")}出发` : "")
-    + (r.total_feasible ? ` · 共 ${r.total_feasible} 个可达` : "")
+    + (r.total_feasible ? ` · 共 ${r.total_feasible} 个${local ? "候选" : "可达"}` : "")
     + ` · 按综合得分排序`
-    + (state.provinces.length ? ` ｜ 范围：${state.provinces.join("、")}` : "")
+    + (!local && state.provinces.length ? ` ｜ 范围：${state.provinces.join("、")}` : "")
     + (r.verdict && r.verdict.why ? ` ｜ AI复核：${r.verdict.why}` : "");
   grid.innerHTML = "";
   state.dests.forEach((d, i) => {
     const card = document.createElement("div");
     card.className = "dest-card"; card.style.animationDelay = (i * 90) + "ms";
     const tr = d.transport_est;
+    const sub = local && d.kind === "市内"
+      ? (d.km >= 1 ? `本城 · ${Math.round(d.km)}km` : "本城")
+      : `${d.province || "周边"} · ${Math.round(d.km)}km`;
+    const trTxt = local && d.kind === "市内"
+      ? tr.desc : `${tr.desc} · ${tr.hours}h 单程`;
     card.innerHTML = `
       <div class="dest-rank">${MEDALS[i]}</div>
       ${d.llm_pick ? `<div class="dest-pick">❖ AI 首推</div>` : ""}
-      <div class="dest-city">${d.city}<i>${d.province} · ${Math.round(d.km)}km</i></div>
-      <div class="dest-tags">${d.in_kb === false ? `<span class="tag niche">小众</span>` : ""}${d.tags.map(t => `<span class="tag">${t}</span>`).join("")}</div>
+      <div class="dest-city">${d.city}<i>${sub}</i></div>
+      <div class="dest-tags">${d.kind ? `<span class="tag kind">${d.kind}</span>` : ""}${d.in_kb === false ? `<span class="tag niche">小众</span>` : ""}${d.tags.map(t => `<span class="tag">${t}</span>`).join("")}</div>
       ${d.ai_comment ? `<div class="dest-ai">${d.ai_comment}</div>` : ""}
       <div class="dest-score">
         <div class="ring">${scoreRing(d.score)}<span class="num">${d.score}</span></div>
         <ul class="dest-reasons">${d.reasons.slice(0,3).map(x => `<li>${x}</li>`).join("")}</ul>
       </div>
       <div class="dest-foot">
-        <div><b>¥${d.rough_total}</b> 估 / ${tr.desc} · ${tr.hours}h 单程
+        <div><b>¥${d.rough_total}</b> ${local ? "人均" : ""}估 / ${trTxt}
           ${d.rough_total > collectParams().budget ? `<span class="budget-bad">略超预算，可降档</span>` : ""}</div>
         <button class="pick-btn">选它 →</button>
       </div>`;
@@ -566,10 +632,13 @@ function renderDestinations(r){
       const tr = d.transport_est || {};
       const mc = document.createElement("div");
       mc.className = "mini-card";
+      const msub = local && d.kind === "市内"
+        ? (d.km >= 1 ? `本城 · ${Math.round(d.km)}km` : "本城")
+        : `${d.province || "周边"} · ${Math.round(d.km)}km`;
       mc.innerHTML = `
-        <div class="mini-top"><b>${d.city}</b><i>${d.province} · ${Math.round(d.km)}km</i>
+        <div class="mini-top"><b>${d.city}</b><i>${msub}</i>
           <span class="mini-score">${d.score}分</span></div>
-        ${(d.in_kb === false) ? `<div class="dest-tags"><span class="tag niche">小众</span>${(d.tags||[]).slice(0,2).map(t=>`<span class="tag">${t}</span>`).join("")}</div>` : ""}
+        ${(d.in_kb === false) ? `<div class="dest-tags">${d.kind ? `<span class="tag kind">${d.kind}</span>` : ""}<span class="tag niche">小众</span>${(d.tags||[]).slice(0,2).map(t=>`<span class="tag">${t}</span>`).join("")}</div>` : ""}
         <div class="mini-reason">${(d.reasons || []).slice(0,2).join("；")}</div>
         <div class="mini-foot"><span>¥${d.rough_total} 估 · ${tr.desc || ""} ${tr.hours ?? ""}h</span>
           <button class="pick-btn mini-pick">选它 →</button></div>`;
@@ -588,7 +657,7 @@ function renderDestinations(r){
   $("#traceReplayDest").closest("details").querySelector("summary")
     .textContent = `Agent 思考回放 · ${$("#traceList").children.length} 步`;
   showView("dest");
-  renderMap(r.origin, state.dests, more);
+  renderMap(r.origin, state.dests, more, local);
 }
 
 function scoreRing(score){
@@ -599,19 +668,20 @@ function scoreRing(score){
 }
 
 /* ── 地图（Leaflet，失败静默降级） ── */
-function renderMap(origin, dests, more){
+function renderMap(origin, dests, more, local){
   const box = $("#mapBox");
   try{
     if (typeof L === "undefined") { box.style.display = "none"; return; }
     box.style.display = "";
     if (state.map){ state.map.remove(); state.map = null; }
-    const map = L.map(box, {scrollWheelZoom:false}).setView([origin.lat, origin.lng], 4);
+    const map = L.map(box, {scrollWheelZoom:false})
+      .setView([origin.lat, origin.lng], local ? 8 : 4);
     state.map = map;
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-      {maxZoom: 12, attribution: "© OpenStreetMap"}).addTo(map);
+      {maxZoom: 15, attribution: "© OpenStreetMap"}).addTo(map);
     L.circleMarker([origin.lat, origin.lng],
       {radius:9, color:"#e0654f", fillColor:"#e0654f", fillOpacity:.9})
-      .addTo(map).bindTooltip(`出发 · ${origin.name}`, {permanent:true, direction:"top"});
+      .addTo(map).bindTooltip(`${local ? "本城" : "出发"} · ${origin.name}`, {permanent:true, direction:"top"});
     (more || []).forEach(d => {           // 其余可达候选：灰色小点
       if (d.lat == null || d.lng == null) return;
       L.circleMarker([d.lat, d.lng],
@@ -622,8 +692,9 @@ function renderMap(origin, dests, more){
       L.circleMarker([d.lat, d.lng],
         {radius:7, color:"#0fa3a8", fillColor:"#0fa3a8", fillOpacity:.8, weight:2})
         .addTo(map).bindTooltip(`${d.city} · ${d.score}分`).on("click", () => runPlans(d.city));
-      L.polyline([[origin.lat, origin.lng],[d.lat, d.lng]],
-        {color:"#0fa3a8", weight:1.5, opacity:.35, dashArray:"5 6"}).addTo(map);
+      if (!local || d.km >= 1)
+        L.polyline([[origin.lat, origin.lng],[d.lat, d.lng]],
+          {color:"#0fa3a8", weight:1.5, opacity:.35, dashArray:"5 6"}).addTo(map);
     });
   }catch(e){ box.style.display = "none"; }
 }
@@ -644,8 +715,14 @@ async function runPlans(dest){
 }
 
 function renderPlans(r){
+  const local = !!r.local;
   const sec = $("#stagePlans"), list = $("#planList");
-  $("#plansTitle").innerHTML = `${r.dest} 出游方案
+  $("#plansTitle").innerHTML = local
+    ? `${r.dest} 本地游玩攻略
+    <small>${r.km >= 1 ? `${r.origin.name} 出发 · 周边 ${Math.round(r.km)}km` : "本城 · 市内出行"}`
+    + `${r.date ? " · " + r.date.slice(5).replace("-", "/") + "出发" : ""}`
+    + ` · ${r.plans.length} 套可选</small>`
+    : `${r.dest} 出游方案
     <small>${r.origin.name} 出发 · ${Math.round(r.km)}km`
     + `${r.date ? " · " + r.date.slice(5).replace("-", "/") + "出发" : ""}`
     + ` · ${r.plans.length} 套可选</small>`;
@@ -738,7 +815,7 @@ function openPlan(i){
 }
 
 function renderPlanDetail(p, r){
-  const t = p.transport;
+  const t = p.transport, local = !!r.local;
   const trainRows = (t.trains || []).map(tr => `
     <tr><td><b>${tr.code}</b></td><td>${tr.from}→${tr.to}</td>
     <td>${tr.dep}–${tr.arr}</td><td>${tr.hours}h</td>
@@ -760,23 +837,40 @@ function renderPlanDetail(p, r){
     </div>`).join("");
 
   const b = p.budget, rows = [
-    ["往返交通", b.transport], ["住宿", b.hotel], ["餐饮", b.food],
-    ["门票", b.tickets], ["市内交通", b.local],
-  ];
+    [local ? "接驳交通" : "往返交通", b.transport], ["住宿", b.hotel],
+    ["餐饮", b.food], ["门票", b.tickets],
+    ["市内交通", b.local],
+  ].filter(x => x[1] > 0);
   const maxB = Math.max(...rows.map(x => x[1]), 1);
 
-  $("#detailBody").innerHTML = `
-    <div class="d-title">${r.dest} · ${p.name}</div>
-    <div class="d-sub">${p.desc} · ${p.pace}节奏 · ${r.origin.name}出发往返${r.date ? " · " + r.date.slice(5).replace("-", "/") + "出发" : ""}</div>
-
+  const tTitle = t.mode === "local" ? "市内出行"
+               : local ? "接驳交通" : "往返交通";
+  const tBadge = t.src === "12306"
+    ? `<span class="src-badge">12306 实时余票 · ${t.query_date || ""}</span>`
+    : `<span class="src-badge est">${t.mode === "local" ? "本城范围" : "估算价 · 仅供参考"}</span>`;
+  const tBox = t.mode === "local" ? `
     <div class="train-box">
-      <h4>往返交通
-        <span class="src-badge ${t.src === "12306" ? "" : "est"}">${t.src === "12306" ? "12306 实时余票 · " + (t.query_date || "") : "估算价 · 仅供参考"}</span></h4>
+      <h4>${tTitle} ${tBadge}</h4>
+      <div style="font-size:12.5px;color:var(--ink2)">${t.outbound || "本城范围 · 地铁/公交/打车/骑行接驳"}</div>
+    </div>` : `
+    <div class="train-box">
+      <h4>${tTitle}
+        ${tBadge}</h4>
       <div class="train-route"><b>${r.origin.name}</b><span class="arrow">⇄</span><b>${r.dest}</b>
         <span style="color:var(--ink3);font-size:12px">单程约 ${t.hours}h · ¥${t.cost}</span></div>
       <div style="font-size:12.5px;color:var(--ink2)">去 ${t.outbound}<br>回 ${t.back}</div>
       ${trainRows ? `<table class="train-table"><tr><th>车次</th><th>区间</th><th>时刻</th><th>历时</th><th>二等座</th><th>一等座</th></tr>${trainRows}</table>` : ""}
-    </div>
+    </div>`;
+
+  const dSub = local
+    ? `${p.desc} · ${p.pace}节奏 · ${r.km >= 1 ? `周边约${Math.round(r.km)}km` : "本城市内"}${r.date ? " · " + r.date.slice(5).replace("-", "/") + "出发" : ""}`
+    : `${p.desc} · ${p.pace}节奏 · ${r.origin.name}出发往返${r.date ? " · " + r.date.slice(5).replace("-", "/") + "出发" : ""}`;
+
+  $("#detailBody").innerHTML = `
+    <div class="d-title">${r.dest} · ${p.name}</div>
+    <div class="d-sub">${dSub}</div>
+
+    ${tBox}
 
     <div class="itin">${itin}</div>
 

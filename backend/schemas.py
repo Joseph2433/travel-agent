@@ -69,11 +69,13 @@ class GuideDigest(BaseModel):
     summary: str = Field(default="", description=(
         "≤120字综合经验谈：这座城实际怎么玩最顺、什么节奏、什么气质"))
     routes: list[str] = Field(default=[], description=(
-        "笔记里反复出现的真实路线安排（按半天/天粒度），每条≤40字，≤4条"))
+        "彼此差异化的真实路线骨架——不同空间走向/主题（古城citywalk线/"
+        "城外山水线/扫街美食线等），不是同一条路的改写版，每条≤40字，≤4条"))
     must_go: list[str] = Field(default=[], description=(
-        "高频被点名的必去地，可带具体位置/时段，≤6条"))
+        "候选池：高频必去+值得去的备选（含城外选项），供下游差异化抽取，"
+        "可带位置/时段，6-10个"))
     eats: list[str] = Field(default=[], description=(
-        "具体到店名/品类的美食，带一句为什么，≤6条"))
+        "具体到店名/品类的美食，带一句为什么，≤8条"))
     pitfalls: list[str] = Field(default=[], description="避雷/差评/排队坑，≤5条")
     booking: list[str] = Field(default=[], description="预约/购票/排队/交通技巧，≤4条")
     notes: list[GNote] = Field(default=[], description="采信笔记清单，≤5篇")
